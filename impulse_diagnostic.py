@@ -45,17 +45,14 @@ WHY IT MATTERS
   amount of weight tuning will move that 46%, and it should be reported as a
   bounded, attributed limitation instead of an open problem.
 
-USAGE
-
-  Drop compute_impulse_split() into evaluate_force_model.py and call it with
-  the per-frame predicted and true contact impulses and the contact mask that
-  the evaluator already computes for the phase split.
+evaluate_force_model.py calls compute_impulse_split() once per trajectory and
+aggregate() over the test set.
 """
 
 import numpy as np
 
 
-def contact_intervals(contact_mask, min_len=1):
+def contact_intervals(contact_mask):
     """Contiguous runs of True in a 1-D boolean mask -> [(start, stop), ...].
 
     An 'interval' is one impact or one continuous period of contact. Splitting
@@ -69,10 +66,10 @@ def contact_intervals(contact_mask, min_len=1):
     edges = np.diff(np.concatenate(([0], m.view(np.int8), [0])))
     starts = np.flatnonzero(edges == 1)
     stops = np.flatnonzero(edges == -1)
-    return [(a, b) for a, b in zip(starts, stops) if b - a >= min_len]
+    return list(zip(starts, stops))
 
 
-def compute_impulse_split(J_pred, J_true, contact_mask, min_len=1, eps=1e-12):
+def compute_impulse_split(J_pred, J_true, contact_mask, eps=1e-12):
     """J_pred, J_true: (T, 3) per-frame contact impulses for ONE trajectory.
     contact_mask: (T,) bool.
 
@@ -84,7 +81,7 @@ def compute_impulse_split(J_pred, J_true, contact_mask, min_len=1, eps=1e-12):
     out = dict(n_intervals=0, E_frame=0.0, E_total=0.0,
                true_impulse=0.0, timing_fraction=float("nan"))
 
-    for a, b in contact_intervals(contact_mask, min_len):
+    for a, b in contact_intervals(contact_mask):
         dp, dt_ = J_pred[a:b], J_true[a:b]
         out["E_frame"] += float(np.linalg.norm(dp - dt_, axis=1).sum())
         out["E_total"] += float(np.linalg.norm(dp.sum(0) - dt_.sum(0)))
@@ -113,38 +110,3 @@ def aggregate(per_traj):
             out[f"impulse_{k}_std"] = float(v.std(ddof=1)) if v.size > 1 else 0.0
     out["impulse_n_traj"] = len(per_traj)
     return out
-
-
-# ======================================================================
-if __name__ == "__main__":
-    rng = np.random.default_rng(0)
-    T = 60
-    mask = np.zeros(T, bool); mask[20:26] = True        # one 6-frame impact
-    J = np.zeros((T, 3)); J[21] = [0.0, 0.0, 1.0]       # impulse in frame 21
-
-    print("  Three synthetic cases, one impact each:\n")
-    print(f"  {'case':<34}{'E_frame/sig':>13}{'E_total/sig':>13}{'timing_frac':>13}")
-
-    r = compute_impulse_split(J.copy(), J, mask)
-    print(f"  {'perfect':<34}{r['E_frame_over_signal']:>13.3f}"
-          f"{r['E_total_over_signal']:>13.3f}{r['timing_fraction']:>13.3f}")
-
-    late = np.zeros_like(J); late[22] = J[21]           # right impulse, 1 frame late
-    r = compute_impulse_split(late, J, mask)
-    print(f"  {'one frame late (pure timing)':<34}{r['E_frame_over_signal']:>13.3f}"
-          f"{r['E_total_over_signal']:>13.3f}{r['timing_fraction']:>13.3f}")
-
-    small = J * 0.5                                     # right timing, half size
-    r = compute_impulse_split(small, J, mask)
-    print(f"  {'50% too small (pure magnitude)':<34}{r['E_frame_over_signal']:>13.3f}"
-          f"{r['E_total_over_signal']:>13.3f}{r['timing_fraction']:>13.3f}")
-
-    smear = np.zeros_like(J); smear[20:23] = J[21] / 3.0   # spread over 3 frames
-    r = compute_impulse_split(smear, J, mask)
-    print(f"  {'smeared over 3 frames':<34}{r['E_frame_over_signal']:>13.3f}"
-          f"{r['E_total_over_signal']:>13.3f}{r['timing_fraction']:>13.3f}")
-
-    print("\n  timing_fraction = 1.0 means the total impulse is exactly right and")
-    print("  every bit of the per-frame error is smearing. 0.0 means the total is")
-    print("  as wrong as the frames. Read it on the real data and the 46% is")
-    print("  either attributed or genuinely open.")

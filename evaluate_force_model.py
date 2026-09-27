@@ -1,11 +1,11 @@
 """
 evaluate_force_model.py
 
-NEW FILE - evaluation for the force-based GNS. Two jobs:
+Evaluation for the force-based GNS. Two jobs:
 
   1. ROLLOUT METRICS - same numbers as the acceleration pipeline (center error
      per block width, angle error, per-phase split), so the Stage-1 parity
-     comparison is apples to apples. compute_metrics is imported unchanged.
+     comparison is apples to apples.
 
   2. WRENCH-DECOMPOSITION VALIDATION - the payoff of the force representation.
      If the dataset folder was labeled by add_wrench_labels.py, the predicted
@@ -18,8 +18,6 @@ NEW FILE - evaluation for the force-based GNS. Two jobs:
 ALIGNMENT: the k-th force prediction of a rollout comes from the window ending
 at original frame t = 2h + k and drives interval t -> t+1, so it pairs with
 wrench label index (2h + k). Average label force over that interval = J[t]/DT.
-
-Set the CONFIG block, then:  python evaluate_force_model.py
 """
 
 import os
@@ -33,23 +31,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import wall
-from force_gns import ForceGNSModel
-from train_force_gns import build_force_dataset, rollout_force_batched
-from generate_node_states import mesh_cube_surface, knn_adjacency, BLOCK_HALF_WIDTH
+from train_force_gns import build_force_dataset, rollout_force_batched, load_trained_model
 
 
-def evaluate_force_model(model_folder, data_folder, test_indices,
-                         model_prefix=None, weights_only=False, unscale=False,
-                         out_prefix=None, checkpoint="best"):
+def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, unscale):
     """Roll out the test set, print metrics, and (if wrench labels are present)
-    validate the force decomposition. Returns the metrics dict so the caller
-    can log or compare. Safe to call right after training in the same script.
-
-    checkpoint: "best" or "final" - which saved model to evaluate.
+    validate the force decomposition. Returns the metrics dict. Figures and the
+    per-trajectory CSV are written to <model_folder>/force_eval_*.
     """
-    MODEL_FOLDER, DATA_FOLDER, TEST_INDICES = model_folder, data_folder, test_indices
-    MODEL_PREFIX, WEIGHTS_ONLY, UNSCALE = model_prefix, weights_only, unscale
-    OUT_PREFIX = out_prefix or os.path.join(model_folder, "force_eval")
+    out_prefix = os.path.join(model_folder, "force_eval")
     # ======================================================================
     # Load model + config (force_cfg in the norms file is the single source of
     # truth for dt / gravity / gates / drag flag - no chance of eval mismatch)
@@ -57,51 +47,16 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Floor = wall.wall(center_position=(0, 0, 0), size=(2, 2), normal=(0, 0, 1))
 
-    if MODEL_PREFIX is None:
-        cands = [f[:-len("_norms.pt")] for f in os.listdir(MODEL_FOLDER)
-                 if f.endswith("_norms.pt")]
-        assert len(cands) == 1, f"set MODEL_PREFIX explicitly, found: {cands}"
-        MODEL_PREFIX = cands[0]
-
-    norms = torch.load(os.path.join(MODEL_FOLDER, MODEL_PREFIX + "_norms.pt"),
-                       weights_only=False)
-    cfg = norms["force_cfg"]
+    model, norms, cfg, rest_nodes, edge_index, _, k_over_m = load_trained_model(
+        model_folder, device)
     print("Loaded force_cfg:", {k: v for k, v in cfg.items() if k != "scale_vec"})
-
-    rest_nodes = torch.tensor(
-        mesh_cube_surface(BLOCK_HALF_WIDTH * 2, cfg["nodes_per_edge"]), dtype=torch.float32)
-    edge_index = torch.tensor(
-        knn_adjacency(rest_nodes.numpy(), k=cfg["nearest_neighbors"]), dtype=torch.long)
-
-    model = ForceGNSModel(norms["x_mean"].shape[0], norms["e_mean"].shape[0],
-                          latent_dim=cfg["latent_dim"], L=cfg["L"], K=cfg["K"])
-    ckpt_name = MODEL_PREFIX + ("_best_model.pt" if checkpoint == "best" else "_final.pt")
-    sd = torch.load(os.path.join(MODEL_FOLDER, ckpt_name),
-                    map_location=device, weights_only=False)
-    if isinstance(sd, dict) and "model_state_dict" in sd:
-        sd = sd["model_state_dict"]
-    if any(k.startswith("_orig_mod.") for k in sd):
-        sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
-    model.load_state_dict(sd)
-    model.to(device).eval()
-
-    # Recovered friction coefficient, written by training to <prefix>_physics.pt.
-    # Captured here (not just printed) so it flows into the returned metrics ->
-    # run_report -> the master CSV, alongside every other headline number.
-    recovered_mu = None
-    phys_path = os.path.join(MODEL_FOLDER, MODEL_PREFIX + "_physics.pt")
-    if os.path.exists(phys_path):
-        pinfo = torch.load(phys_path, map_location="cpu", weights_only=False)
-        recovered_mu = float(pinfo.get("recovered_mu", float("nan")))
-        if pinfo.get("mu_mode") == "learnable":
-            print(f"Recovered friction coefficient mu = {recovered_mu:.4f}"
-                  f"   (replica ground truth: 0.198)")
+    print(f"Rolling out with the checkpoint's k/m = {k_over_m:.5f}")
 
     # ======================================================================
     # Rollout the test set
     # ======================================================================
-    trajs, _ = build_force_dataset(TEST_INDICES, DATA_FOLDER,
-                                   weights_only=WEIGHTS_ONLY, unscale_data=UNSCALE)
+    trajs, _ = build_force_dataset(test_indices, data_folder,
+                                   weights_only=weights_only, unscale_data=unscale)
     for d in trajs:
         d["edge_index"] = edge_index
 
@@ -113,7 +68,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
         norms["x_mean"], norms["x_std"], norms["e_mean"], norms["e_std"],
         cfg["scale_vec"], cfg["ang_scale_vec"], g_step, dt, device,
         use_wind=cfg["use_wind"], use_drag_baseline=cfg["use_drag_baseline"],
-        k_over_m=cfg["k_over_m"], contact_d0=cfg["contact_d0"],
+        k_over_m=k_over_m, contact_d0=cfg["contact_d0"],
         contact_tau=cfg["contact_tau"], mass=mass,
         return_forces=True, return_per_traj=True)
 
@@ -151,8 +106,8 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
               "phase": []}
     drag_num = drag_den = 0.0
 
-    for b, idx in enumerate(TEST_INDICES):
-        raw = torch.load(os.path.join(DATA_FOLDER, f"{idx}.pt"), weights_only=False)
+    for b, idx in enumerate(test_indices):
+        raw = torch.load(os.path.join(data_folder, f"{idx}.pt"), weights_only=False)
         row = dict(idx=idx, center=float(per_traj[b]["center_error"]),
                    angle=float(per_traj[b]["angle_error_deg"]))
         if len(raw) > 4 and isinstance(raw[4], dict) and "J_contact" in raw[4]:
@@ -305,7 +260,8 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
         if drag_den > 0:
             k_rec = drag_num / drag_den
             print(f"\nDrag recovery: implied k/m from PREDICTED fluid force = {k_rec:.5f} 1/m"
-                  f"   (calibrated reference: {cfg['k_over_m']:.5f})")
+                  f"   (calibrated reference: {cfg['k_over_m']:.5f}, "
+                  f"model's k/m: {k_over_m:.5f})")
 
         # ---------------- figure ----------------
         fig, axes = plt.subplots(2, 2, figsize=(12, 9))
@@ -315,7 +271,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
         axes[0, 0].plot(t_ax, pooled["Fc_true"][0][:, 2], "k-", lw=1.5, label="MuJoCo")
         axes[0, 0].plot(t_ax, pooled["Fc_pred"][0][:, 2], "C1--", lw=1.2, label="predicted")
         axes[0, 0].axhline(mg, color="gray", ls=":", lw=1, label="m g")
-        axes[0, 0].set_title(f"contact force z - traj {list(TEST_INDICES)[b0]}")
+        axes[0, 0].set_title(f"contact force z - traj {list(test_indices)[b0]}")
         axes[0, 0].set_xlabel("prediction step"); axes[0, 0].set_ylabel("N"); axes[0, 0].legend()
 
         axes[0, 1].plot(t_ax, np.linalg.norm(pooled["Ff_true"][0][:, :2], axis=1), "k-",
@@ -336,22 +292,22 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
 
         for ax in axes.flat:
             ax.grid(alpha=0.3)
-        fig.suptitle(f"Force decomposition validation - {os.path.basename(DATA_FOLDER)}")
+        fig.suptitle(f"Force decomposition validation - {os.path.basename(data_folder)}")
         fig.tight_layout()
-        fig.savefig(OUT_PREFIX + "_wrench.png", dpi=150)
-        print(f"\nSaved figure to {OUT_PREFIX}_wrench.png")
+        fig.savefig(out_prefix + "_wrench.png", dpi=150)
+        print(f"\nSaved figure to {out_prefix}_wrench.png")
     else:
         print("\n(no wrench labels in this folder - run add_wrench_labels.py to "
               "enable the decomposition validation)")
 
-    with open(OUT_PREFIX + "_per_traj.csv", "w", newline="") as f:
+    with open(out_prefix + "_per_traj.csv", "w", newline="") as f:
         keys = sorted({k for r in rows for k in r})
         w = csv.DictWriter(f, fieldnames=keys, restval="")
         w.writeheader(); w.writerows(rows)
-    print(f"Saved per-trajectory CSV to {OUT_PREFIX}_per_traj.csv")
+    print(f"Saved per-trajectory CSV to {out_prefix}_per_traj.csv")
 
-    # Key names deliberately mirror evaluate_model() in evaluate_metrics.py so
-    # run_report.py's formatter and comparison table work on force runs too.
+    # phase_center / phase_angle are split into one CSV column per phase by
+    # run_report.save_run_report.
     out = dict(
         center_error=float(center),
         angle_error_deg=float(angle),
@@ -368,73 +324,5 @@ def evaluate_force_model(model_folder, data_folder, test_indices,
         n_test=float(len(per_traj)),
         have_wrench_labels=float(bool(have_labels)),
     )
-    if recovered_mu is not None:
-        out["recovered_mu"] = recovered_mu
     out.update(wrench_metrics)
-
-    # ---- checkpoint-derived values, folded into the RETURNED metrics ------
-    # recovered_k_over_m, the mu/k traces and the converged prediction loss
-    # live in _physics.pt and _loss_history.pt, which only the trainer writes.
-    # Reading them HERE rather than in the run file means they reach the CSV
-    # for every experiment: evaluate_force_model is the one function every run
-    # passes through, whereas the run file is copied per experiment
-    # (Test_37.py, Test_43.py, ...) and only one copy ever carries the call.
-    # They land as metrics.* instead of settings.*; the values are identical.
-    try:
-        import glob as _glob
-        from run_diagnostics import collect_run_diagnostics
-        # Per-epoch diagnostics too. physics_losses.DIAG_HISTORY is module
-        # state in THIS process, so the evaluator can read what training just
-        # accumulated - no need for the run file to forward it. Doing both
-        # here means every diagnostic lands under metrics.* for every run,
-        # regardless of which copy of the run script launched it.
-        try:
-            from physics_losses import summarize_diagnostics
-            _diag = summarize_diagnostics(last_n=20)
-            if _diag:
-                out.update({k: float(v) for k, v in _diag.items()
-                            if isinstance(v, (int, float))
-                            and not isinstance(v, bool)})
-                print(f"  per-epoch diagnostics: {len(_diag)} value(s) added")
-        except Exception as _e:
-            print(f"  [evaluate] per-epoch diagnostics unavailable: {_e}")
-
-        _hits = sorted(_glob.glob(os.path.join(model_folder, "*_physics.pt")))
-        if _hits:
-            _stem = _hits[0][: -len("_physics.pt")] + ".pt"
-            _extra = collect_run_diagnostics(_stem)
-            # NUMERIC ONLY. run_report.py does float(v) on every metric, so a
-            # string here (mu_mode / k_mode are "learnable" / "frozen" /
-            # "fixed") raises ValueError and kills the CSV write AFTER a
-            # completed 10k-epoch run. Those two are recoverable from
-            # settings.learn_mu / settings.learn_k anyway.
-            _extra = {k: float(v) for k, v in _extra.items()
-                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            if _extra:
-                print(f"  checkpoint diagnostics: {len(_extra)} numeric "
-                      "value(s) added to the run report")
-                out.update(_extra)
-    except Exception as _e:                # never fail an eval over reporting
-        print(f"  [evaluate] checkpoint diagnostics unavailable: {_e}")
-
     return out
-
-
-# ======================================================================
-# Standalone use:  python evaluate_force_model.py
-# ======================================================================
-if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    DATA_FOLDER = os.path.join(script_dir, "data/mojoco_paper_replica_0_wind")
-    MODEL_FOLDER = os.path.join(script_dir, "models/force_stage1")
-    MODEL_PREFIX = None            # None -> auto-detect "<n>_force_gns_model" in MODEL_FOLDER
-    TEST_INDICES = range(454, 568)
-    WEIGHTS_ONLY = False
-    UNSCALE = False
-
-    OUT_PREFIX = os.path.join(MODEL_FOLDER, "force_eval")
-
-    evaluate_force_model(MODEL_FOLDER, DATA_FOLDER, TEST_INDICES,
-                         model_prefix=MODEL_PREFIX, weights_only=WEIGHTS_ONLY,
-                         unscale=UNSCALE, out_prefix=OUT_PREFIX)

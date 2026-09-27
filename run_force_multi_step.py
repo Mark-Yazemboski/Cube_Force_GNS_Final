@@ -11,6 +11,7 @@ from train_force_gns import train_force_gnn
 from evaluate_force_model import evaluate_force_model
 from visualize_force_model import visualize_force_rollout
 from run_report import save_run_report
+from run_diagnostics import collect_run_diagnostics
 from generate_node_states import BLOCK_HALF_WIDTH
 from physics_losses import summarize_diagnostics, reset_diagnostics
 
@@ -136,12 +137,11 @@ contact_tau = 0.005             # gate width (m)
 K_OVER_M = 0.0285      #Initilized value for the drag coefficient at the cube's center of mass
 
 LEARN_K = True        # Setting to determine if k/m should be optimized for during training
-
-FIX_K = None           # or a float to hard-fix k (the +/-50% sensitivity arms)
+                      # (False holds k/m fixed at K_OVER_M)
 
 MU_INIT = 0.3          # friction coefficient init
 LEARN_MU = True        # recover mu from data (the drag-coefficient story)
-FIX_MU = None          # or e.g. 1.9/9.615 to hard-fix it (ablation arm)
+                       # (False holds mu fixed at MU_INIT)
 
 
 
@@ -165,25 +165,20 @@ loss_mode = "accel"
 #     -> w_fluid_anchor pins fluid to the analytic drag law
 #     -> w_fluid_smooth forbids the jumpy, contact-synchronized compensation
 #        (the chaotic pink arrow) - NEEDS multistep >= 2
-#     -> w_diss gives the displaced friction a correctly-structured home:
-#        anti-parallel to slip, proportional to the local normal force,
-#        one global mu. mu is LEARNABLE by default, so the model recovers
-#        the friction coefficient the same way it recovered the drag
-#        coefficient (replica ground truth: mu = 0.198).
-#   h_pen needs no weight: normal forces are >= 0 by construction (softplus). Set each so its weighted term
-# is ~1-10% of the position loss at init; raw magnitudes print every epoch.
+#     -> w_fric_dir / w_fric_mag give the displaced friction a
+#        correctly-structured home: anti-parallel to slip, proportional to
+#        the local normal force, one global mu. mu is LEARNABLE by default,
+#        so the model recovers the friction coefficient the same way it
+#        recovered the drag coefficient (replica ground truth: mu = 0.198).
+#   h_pen needs no weight: normal forces are >= 0 by construction (softplus).
 # --- CONTACT / friction ---------------------------------------------
-# w_diss is the ORIGINAL joint Coulomb term. It minimizes
-#   || phi_t + mu phi_n vhat ||^2, one squared residual over a vector, so a
-# single global mu absorbs any directional error:  mu -> mu_true * <cos>.
-# Measured on this dataset: mu_param 0.156 vs mu_implied 0.216 -> ~44 deg of
-# mean misalignment. Use the SPLIT pair instead; keep w_diss for the ablation.
-w_diss = 0.0           # gamma_1  : JOINT Coulomb (legacy / ablation arm)
+# Coulomb friction is enforced as two separate halves (direction, magnitude)
+# rather than one joint residual || phi_t + mu phi_n vhat ||^2: with the joint
+# form a single global mu absorbs any directional error (mu -> mu_true * <cos>;
+# measured here: mu_param 0.156 vs mu_implied 0.216, ~44 deg of misalignment).
 w_fric_dir = .3       # gamma_1a : direction half - fixes crossing arrows
 w_fric_mag = .1       # gamma_1b : magnitude half - mu's ONLY gradient path
 w_fric_cone= 1.5       # gamma_1c : ||phi_t|| <= mu phi_n, STATIC regime too
-w_sparse = 0.0         # contact sparsity - leave off (shrinks legitimate
-                       # resting normal forces too)
 
 # --- FLUID -----------------------------------------------------------
 # The anchor ladder (Aug 28-29, 3 seeds/cell) was monotonic with no motion
@@ -191,11 +186,6 @@ w_sparse = 0.0         # contact sparsity - leave off (shrinks legitimate
 # center error flat within the baseline spread. It had NOT plateaued at 1e-1.
 w_fluid_anchor = 3e-2  # gamma_3a: fluid FORCE == analytic drag law
 w_fluid_smooth = 3e-2  # gamma_3b: fluid force smooth in time (K >= 2 only)
-
-
-
-
-rot_noise_scale = None
 
 
 
@@ -257,15 +247,14 @@ if Train_model:
         gravity=GRAVITY,
         mass=MASS,
         use_drag_baseline=use_drag_baseline,
-        k_over_m=K_OVER_M, learn_k=LEARN_K, fix_k=FIX_K,
+        k_over_m=K_OVER_M, learn_k=LEARN_K,
         contact_d0=contact_d0,
         contact_tau=contact_tau,
         loss_mode=loss_mode,
-        w_diss=w_diss, w_sparse=w_sparse,
         w_fric_dir=w_fric_dir, w_fric_mag=w_fric_mag, w_fric_cone=w_fric_cone,
         w_fluid_anchor=w_fluid_anchor,
         w_fluid_smooth=w_fluid_smooth,
-        mu_init=MU_INIT, learn_mu=LEARN_MU, fix_mu=FIX_MU,
+        mu_init=MU_INIT, learn_mu=LEARN_MU,
         validation_check_interval=validation_check_interval,
         epoch_checkpoint_interval=epoch_checkpoint_interval,
         keep_last_n_checkpoints=keep_last_n_checkpoints,
@@ -283,24 +272,33 @@ if Evaluate_model:
         weights_only=weights_only_load,
         unscale=unscale_trajectory_data,
     )
+
+    # Mean over the last 20 epochs of the per-epoch diagnostics that
+    # slip_gate_report() recorded during training (one per epoch, from that
+    # epoch's first batch): friction alignment, mu_implied, slip-gate
+    # occupancy. These are the metrics the friction sweep is ranked on, so
+    # they belong in the same CSV row as force_contact_err_contact instead of
+    # only in the log. Averaged, not final-value: one batch is noisy.
+    # Empty when this process did not train (Train_model = False).
+    diagnostics = summarize_diagnostics(last_n=20)
+    metrics.update({k: float(v) for k, v in diagnostics.items()})
+
+    # Recovered mu / k/m, their traces, and the converged training loss, read
+    # from the checkpoints training wrote. Never fail a finished run over
+    # reporting.
+    try:
+        metrics.update(collect_run_diagnostics(save_model_path))
+    except Exception as e:
+        print(f"  checkpoint diagnostics unavailable: {e}")
+
     print("\nSummary:", {k: (round(v, 4) if isinstance(v, float) else v)
                          for k, v in metrics.items()})
 
     if Save_run_report:
-        # Mean over the last 20 epochs of the per-epoch diagnostics that
-        # slip_gate_report() accumulated during training: friction alignment,
-        # mu_implied, slip-gate occupancy, and (if the trainer pushes them)
-        # the raw physics-term magnitudes. These are the metrics the friction
-        # sweep is ranked on, so they belong in the same CSV row as
-        # force_contact_err_contact instead of only in the log.
-        # Averaged, not final-value: one batch per epoch is noisy.
-        diagnostics = summarize_diagnostics(last_n=20)
         print("\nEnd-of-run diagnostics (mean of last "
               f"{diagnostics.get('diag_n_epochs', 0)} epochs):")
         for k, v in sorted(diagnostics.items()):
-            # mu_mode / k_mode are strings; ':.6g' only formats numbers.
-            print(f"    {k:<22} {v:.6g}" if isinstance(v, (int, float))
-                  else f"    {k:<22} {v}")
+            print(f"    {k:<22} {v:.6g}")
 
         settings = dict(
             architecture="force",           # distinguishes these rows at a glance
@@ -319,26 +317,23 @@ if Evaluate_model:
             learning_rate=learning_rate,
             epochs=epochs,
             noise_scale=noise_scale,
-            rot_noise_scale=rot_noise_scale,
             multistep=multistep,
             curriculum_epochs=curriculum_epochs,
             scheduler=Learning_Rate_Scheduler,
             loss_mode=loss_mode,
             use_wind=use_wind_feature,
             use_drag_baseline=use_drag_baseline,
-            k_over_m=K_OVER_M, learn_k=LEARN_K, fix_k=FIX_K,
+            k_over_m=K_OVER_M, learn_k=LEARN_K,
             contact_d0=contact_d0,
             contact_tau=contact_tau,
             dt=DT, gravity=GRAVITY, mass=MASS,
-            w_diss=w_diss, w_sparse=w_sparse,
             w_fric_dir=w_fric_dir, w_fric_mag=w_fric_mag,
             w_fric_cone=w_fric_cone,
             w_fluid_anchor=w_fluid_anchor,
             w_fluid_smooth=w_fluid_smooth,
-            learn_mu=LEARN_MU, fix_mu=FIX_MU,
-            **diagnostics,
+            learn_mu=LEARN_MU,
         )
-        save_run_report(model_folder_path, settings, metrics, slopes=[],
+        save_run_report(model_folder_path, settings, metrics,
                         run_name=extra_name, master_csv=FORCE_MASTER_CSV)
 
 # ----------------------------------------------------------------------

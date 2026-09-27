@@ -1,11 +1,9 @@
 """
 visualize_force_model.py
 
-NEW FILE - does not modify any existing code.
-
-Same job as animate_cube() in display_results.py (red predicted cube, blue
-ground-truth cube, wireframe edges, 3D animation, optional GIF), but for the
-force model - and it additionally draws the forces the model is predicting:
+3D animation of a force-model rollout (red predicted cube, blue ground-truth
+cube, wireframe edges, optional GIF) that also draws the forces the model is
+predicting:
 
   * TWO arrows per node in contact:
       - NORMAL    (green)  along the wall normal, >= 0 by construction
@@ -16,16 +14,17 @@ force model - and it additionally draws the forces the model is predicting:
     the analytic drag baseline if that was enabled). No torque arrow.
 
 ARROW SCALE IS PHYSICAL, NOT PER-FRAME NORMALIZED. A force equal to the cube's
-weight (m g) is drawn MG_ARROW_WIDTHS block-widths long, so arrow length means
-the same thing in every frame and every trajectory. The HUD prints the summed
-normal force as a multiple of m g: when the cube comes to rest that number
-should sit near 1.0, which is a free sanity check on the model that costs
-nothing to look at.
+weight (m g) is drawn mg_arrow_widths block-widths long, so arrow length means
+the same thing in every frame and every trajectory (see arrow_len for how
+larger forces are compressed). The HUD prints the summed normal force as a
+multiple of m g: when the cube comes to rest that number should sit near 1.0,
+which is a free sanity check on the model that costs nothing to look at.
 
 Rollout only - the cube follows the model's own predictions and the forces are
 whatever it predicts as it drifts.
 
-USAGE: set the CONFIG block and run.  python visualize_force_model.py
+Called by run_force_multi_step.py (GIFs) and make_filmstrip.py (vector frames
+for figures).
 """
 
 import os
@@ -40,13 +39,12 @@ from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 import wall
-from force_gns import ForceGNSModel, BLOCK_WIDTH
-from train_force_gns import build_force_dataset, rollout_force_batched
-from generate_node_states import mesh_cube_surface, knn_adjacency, BLOCK_HALF_WIDTH
+from generate_node_states import BLOCK_WIDTH
+from train_force_gns import build_force_dataset, rollout_force_batched, load_trained_model
 
 
 # ======================================================================
-# ADDED: pick the frames that are worth a panel
+# Pick the frames that are worth a filmstrip panel
 # ======================================================================
 def auto_frames(f_norm, f_tang, MG, h, L, t_contact, t_settle, n_panels=6,
                 min_active=4, min_frac=0.02):
@@ -152,78 +150,50 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
                             mg_arrow_widths=1.0, min_arrow_frac=0.002,
                             draw_floor=True, draw_ground_truth=True,
                             checkpoint="best",
-                            # --- ADDED: display gains, previously hardcoded ---
+                            # per-channel display gain on top of the physical scale
                             normal_gain=1.0, tangent_gain=8.0, fluid_gain=1.0,
-                            # --- ADDED: vector frame export for the poster ---
+                            # vector frame export (filmstrip)
                             save_frames=None, n_panels=6, frame_dir=None,
                             frame_format="pdf", frame_clean=True,
                             elev=18, azim=-62, make_gif=True,
-                            # --- ADDED: arrow length mapping ---
+                            # arrow length mapping (see arrow_len)
                             arrow_mode="log", max_arrow_widths=2.2,
-                            # --- ADDED: camera zoom, >1 is closer ---
+                            # camera zoom, >1 is closer
                             zoom=1.13,
-                            # --- ADDED: sliding frame node requirement ---
+                            # loaded nodes required in the auto-picked sliding frame
                             slide_min_nodes=4):
     """Roll out ONE trajectory and animate it with per-node contact-force
-    arrows (normal + tangential) and a COM fluid-force arrow. Returns the path
-    of the saved GIF. show=False is the default so this is safe to call from a
-    batch job on a compute node."""
-    MODEL_FOLDER, DATA_FOLDER, TRAJECTORY = model_folder, data_folder, trajectory
-    MODEL_PREFIX, WEIGHTS_ONLY, UNSCALE = model_prefix, weights_only, unscale
-    SHOW, INTERVAL = show, interval
-    MG_ARROW_WIDTHS, MIN_ARROW_FRAC = mg_arrow_widths, min_arrow_frac
-    DRAW_FLOOR, DRAW_GROUND_TRUTH = draw_floor, draw_ground_truth
-    SAVE_PATH = save_path if save_path is not None else os.path.join(
-        model_folder, f"force_rollout_{trajectory}.gif")
+    arrows (normal + tangential) and a COM fluid-force arrow.
+
+    save_frames: None (no frames), "auto" (auto_frames picks the event
+                 frames), or a list of frame numbers; each is written as a
+                 separate vector file for a filmstrip figure.
+
+    Returns {"gif", "frames", "t_contact", "t_settle", "n_frames"}.
+    show=False is the default so this is safe to call from a batch job on a
+    compute node."""
+    if save_path is None:
+        save_path = os.path.join(model_folder, f"force_rollout_{trajectory}.gif")
     C_NORMAL, C_TANGENT, C_FLUID = "tab:green", "tab:orange", "magenta"
 
-    # --- arrow appearance ---
-    # CHANGED: these used to be hardcoded here, which silently overwrote the
-    # function arguments of the same name - passing mg_arrow_widths=2.0 or
-    # min_arrow_frac=... did nothing at all. They are parameters now.
-    NORMAL_GAIN, TANGENT_GAIN, FLUID_GAIN = normal_gain, tangent_gain, fluid_gain
     # ======================================================================
     # Load model + config
     # ======================================================================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Floor = wall.wall(center_position=(0, 0, 0), size=(2, 2), normal=(0, 0, 1))
 
-    if MODEL_PREFIX is None:
-        cands = [f[:-len("_norms.pt")] for f in os.listdir(MODEL_FOLDER)
-                 if f.endswith("_norms.pt")]
-        assert len(cands) == 1, f"set MODEL_PREFIX explicitly, found: {cands}"
-        MODEL_PREFIX = cands[0]
-
-    norms = torch.load(os.path.join(MODEL_FOLDER, MODEL_PREFIX + "_norms.pt"),
-                       weights_only=False)
-    cfg = norms["force_cfg"]
+    model, norms, cfg, rest_nodes, edge_index, model_prefix, k_over_m = load_trained_model(
+        model_folder, device, prefix=model_prefix, checkpoint=checkpoint)
     h, dt, mass, g = cfg["h"], cfg["dt"], cfg["mass"], cfg["gravity"]
     MG = mass * g
-    print(f"Model: {MODEL_PREFIX}   dt={dt:.6f}s  m={mass}kg  g={g}  "
+    print(f"Model: {model_prefix}   dt={dt:.6f}s  m={mass}kg  g={g}  "
           f"drag_baseline={cfg['use_drag_baseline']}  use_wind={cfg['use_wind']}")
-
-    rest_nodes = torch.tensor(
-        mesh_cube_surface(BLOCK_HALF_WIDTH * 2, cfg["nodes_per_edge"]), dtype=torch.float32)
-    edge_index = torch.tensor(
-        knn_adjacency(rest_nodes.numpy(), k=cfg["nearest_neighbors"]), dtype=torch.long)
-
-    model = ForceGNSModel(norms["x_mean"].shape[0], norms["e_mean"].shape[0],
-                          latent_dim=cfg["latent_dim"], L=cfg["L"], K=cfg["K"])
-    ckpt_name = MODEL_PREFIX + ("_best_model.pt" if checkpoint == "best" else "_final.pt")
-    sd = torch.load(os.path.join(MODEL_FOLDER, ckpt_name),
-                    map_location=device, weights_only=False)
-    if isinstance(sd, dict) and "model_state_dict" in sd:
-        sd = sd["model_state_dict"]
-    if any(k.startswith("_orig_mod.") for k in sd):
-        sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
-    model.load_state_dict(sd)
-    model.to(device).eval()
 
     # ======================================================================
     # Roll out the one trajectory, keeping the forces
     # ======================================================================
-    trajs, _ = build_force_dataset([TRAJECTORY], DATA_FOLDER,
-                                   weights_only=WEIGHTS_ONLY, unscale_data=UNSCALE,
+    trajs, _ = build_force_dataset([trajectory], data_folder,
+                                   weights_only=weights_only, unscale_data=unscale,
                                    verbose_every=0)
     trajs[0]["edge_index"] = edge_index
     g_step = torch.tensor([0.0, 0.0, -g]) * dt * dt
@@ -233,7 +203,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
         norms["x_mean"], norms["x_std"], norms["e_mean"], norms["e_std"],
         cfg["scale_vec"], cfg["ang_scale_vec"], g_step, dt, device,
         use_wind=cfg["use_wind"], use_drag_baseline=cfg["use_drag_baseline"],
-        k_over_m=cfg["k_over_m"], contact_d0=cfg["contact_d0"],
+        k_over_m=k_over_m, contact_d0=cfg["contact_d0"],
         contact_tau=cfg["contact_tau"], mass=mass,
         return_forces=True, return_per_traj=True)
 
@@ -242,7 +212,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
     true = true_all[0, :L]
     m0 = per_traj[0]
     t_contact, t_settle = int(m0["t_contact"]), int(m0["t_settle"])
-    print(f"traj {TRAJECTORY}: center {m0['center_error']:.4f} widths | "
+    print(f"traj {trajectory}: center {m0['center_error']:.4f} widths | "
           f"angle {m0['angle_error_deg']:.2f} deg | contact@{t_contact} settle@{t_settle}")
 
     # Force arrays are per PREDICTION STEP. Step i is computed at the state
@@ -255,10 +225,10 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
     assert n_steps >= L - h - 1, "force/frame alignment mismatch"
 
     # ======================================================================
-    # Figure setup (mirrors animate_cube)
+    # Figure setup
     # ======================================================================
-    ARROW_SCALE = MG_ARROW_WIDTHS * BLOCK_WIDTH / MG      # meters of arrow per Newton
-    MIN_F = MIN_ARROW_FRAC * MG
+    ARROW_SCALE = mg_arrow_widths * BLOCK_WIDTH / MG      # meters of arrow per Newton
+    MIN_F = min_arrow_frac * MG
     MAX_LEN = max_arrow_widths * BLOCK_WIDTH
 
     def arrow_len(mag_N, gain):
@@ -266,8 +236,8 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
 
         "linear"  physical and honest: length is proportional to force, so a
                   30 N impact draws 30x the 1 N friction and leaves the frame.
-        "log"     length = gain * MG_ARROW_WIDTHS * log1p(F/MG) / log(2), so a
-                  force of m*g still draws MG_ARROW_WIDTHS long and everything
+        "log"     length = gain * mg_arrow_widths * log1p(F/MG) / log(2), so a
+                  force of m*g still draws mg_arrow_widths long and everything
                   above it is compressed. Impact peaks and friction are both
                   legible in one frame. Ordering is preserved, ratios are NOT -
                   say "log-scaled arrow lengths" in the caption.
@@ -280,7 +250,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
         if arrow_mode == "clip":
             return np.minimum(ARROW_SCALE * gain * m, MAX_LEN)
         # log
-        return (gain * MG_ARROW_WIDTHS * BLOCK_WIDTH
+        return (gain * mg_arrow_widths * BLOCK_WIDTH
                 * np.log1p(m / MG ) / np.log(2.0))
 
     def scaled(vecs, gain):
@@ -294,7 +264,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
     ax = fig.add_subplot(111, projection='3d')
 
     ei = edge_index.numpy()
-    all_pos = torch.cat([pred, true], dim=0) if DRAW_GROUND_TRUTH else pred
+    all_pos = torch.cat([pred, true], dim=0) if draw_ground_truth else pred
     pad = 0.5 * BLOCK_WIDTH
     lims = [
         (float(all_pos[:, :, 0].min()) - pad, float(all_pos[:, :, 0].max()) + pad),
@@ -302,16 +272,16 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
         (min(0.0, float(all_pos[:, :, 2].min())) - 0.2 * pad,
          float(all_pos[:, :, 2].max()) + pad),
     ]
-    # ADDED: zoom > 1 pulls the camera in by shrinking the view about its
-    # centre. 1.13 is about 13% closer. The floor stays put because the z
-    # range is shrunk about its own centre too, so raise `zoom` gently.
+    # zoom > 1 pulls the camera in by shrinking the view about its centre.
+    # 1.13 is about 13% closer. The floor stays put because the z range is
+    # shrunk about its own centre too, so raise `zoom` gently.
     if zoom and zoom != 1.0:
         lims = [(c - (hi - lo) / (2 * zoom), c + (hi - lo) / (2 * zoom))
                 for lo, hi in lims for c in [(lo + hi) / 2]]
     ax.set_xlim(*lims[0]); ax.set_ylim(*lims[1]); ax.set_zlim(*lims[2])
     ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
 
-    if DRAW_FLOOR:
+    if draw_floor:
         span = float(max(all_pos[:, :, 0].max() - all_pos[:, :, 0].min(),
                          all_pos[:, :, 1].max() - all_pos[:, :, 1].min())) + 2 * pad
         centre = (float(all_pos[:, :, 0].mean()), float(all_pos[:, :, 1].mean()), 0.0)
@@ -320,23 +290,23 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
 
     pred_scatter = ax.scatter([], [], [], c='r', s=25, label='Pred')
     gt_scatter = (ax.scatter([], [], [], c='b', s=25, alpha=0.4, label='GT')
-                  if DRAW_GROUND_TRUTH else None)
+                  if draw_ground_truth else None)
     pred_edge_lines = [ax.plot([], [], [], c='r', alpha=0.35, linewidth=1.0)[0]
                        for _ in range(ei.shape[1])]
     gt_edge_lines = ([ax.plot([], [], [], c='b', alpha=0.2, linewidth=1.0)[0]
-                      for _ in range(ei.shape[1])] if DRAW_GROUND_TRUTH else [])
+                      for _ in range(ei.shape[1])] if draw_ground_truth else [])
 
     # legend proxies for the arrow colors
     ax.plot([], [], [], c=C_NORMAL, lw=2, label='contact normal')
     ax.plot([], [], [], c=C_TANGENT, lw=2,
-            label=f'contact tangential (x{TANGENT_GAIN:g})')
+            label=f'contact tangential (x{tangent_gain:g})')
     ax.plot([], [], [], c=C_FLUID, lw=2, label='fluid @ COM')
     ax.legend(loc='upper left', fontsize=8)
 
     hud = fig.text(0.015, 0.015, "", fontsize=9, family='monospace', va='bottom')
-    ax.set_title(f"traj {TRAJECTORY} - red=pred, blue=GT | "
-             f"arrow: {MG_ARROW_WIDTHS:g} width = m g = {MG:.2f} N"
-             f"  (tangential x{TANGENT_GAIN:g})")
+    ax.set_title(f"traj {trajectory} - red=pred, blue=GT | "
+             f"arrow: {mg_arrow_widths:g} width = m g = {MG:.2f} N"
+             f"  (tangential x{tangent_gain:g})")
 
     quivers = []            # mutable holder so update() can clear last frame's arrows
 
@@ -355,7 +325,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
             pred_edge_lines[i].set_data([p[s, 0], p[d, 0]], [p[s, 1], p[d, 1]])
             pred_edge_lines[i].set_3d_properties([p[s, 2], p[d, 2]])
 
-        if DRAW_GROUND_TRUTH:
+        if draw_ground_truth:
             t = true[frame].numpy()
             gt_scatter._offsets3d = (t[:, 0], t[:, 1], t[:, 2])
             for i in range(ei.shape[1]):
@@ -374,8 +344,8 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
             ft = f_tang[k].numpy()
             ff = f_fluid[k].numpy()
 
-            for vecs, color, gain in ((fn, C_NORMAL, NORMAL_GAIN),
-                                    (ft, C_TANGENT, TANGENT_GAIN)):
+            for vecs, color, gain in ((fn, C_NORMAL, normal_gain),
+                                    (ft, C_TANGENT, tangent_gain)):
                 mags = np.linalg.norm(vecs, axis=1)
                 sel = mags > MIN_F
                 if sel.any():
@@ -387,7 +357,7 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
 
             com = p.mean(axis=0)
             if np.linalg.norm(ff) > MIN_F:
-                a = scaled(ff, FLUID_GAIN)
+                a = scaled(ff, fluid_gain)
                 quivers.append(ax.quiver(
                     com[0], com[1], com[2],
                     a[0], a[1], a[2],
@@ -418,20 +388,20 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
         pass                                     # older matplotlib 3d has no equal aspect
 
     # ==================================================================
-    # ADDED: vector frame export for the filmstrip
+    # Vector frame export for the filmstrip
     # ==================================================================
     frame_paths = []
     if save_frames is not None:
         if isinstance(save_frames, str) and save_frames == "auto":
             idx = auto_frames(f_norm, f_tang, MG, h, L, t_contact, t_settle,
                               n_panels=n_panels, min_active=slide_min_nodes,
-                              min_frac=MIN_ARROW_FRAC)
+                              min_frac=min_arrow_frac)
             print(f"  auto-selected frames: {idx}")
         else:
             idx = sorted({int(f) for f in save_frames if 0 <= int(f) < L})
 
         fdir = frame_dir or os.path.join(
-            os.path.dirname(SAVE_PATH) or ".", f"frames_traj{TRAJECTORY}")
+            os.path.dirname(save_path) or ".", f"frames_traj{trajectory}")
         os.makedirs(fdir, exist_ok=True)
 
         # Strip the on-screen furniture: a poster panel wants the cube and the
@@ -462,63 +432,18 @@ def visualize_force_rollout(model_folder, data_folder, trajectory,
                 leg.set_visible(True)
             ax.set_axis_on()
 
-    ani = animation.FuncAnimation(fig, update, frames=L, interval=INTERVAL, blit=False)
+    ani = animation.FuncAnimation(fig, update, frames=L, interval=interval, blit=False)
 
-    if SAVE_PATH is not None and make_gif:
-        os.makedirs(os.path.dirname(SAVE_PATH) or ".", exist_ok=True)
-        print(f"Saving animation to {SAVE_PATH} ...")
-        ani.save(SAVE_PATH, writer='pillow', fps=max(1, 1000 // INTERVAL))
+    if make_gif:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        print(f"Saving animation to {save_path} ...")
+        ani.save(save_path, writer='pillow', fps=max(1, 1000 // interval))
         print("Saved successfully.")
 
-    if SHOW:
+    if show:
         plt.show()
     else:
         plt.close(fig)
-    return {"gif": SAVE_PATH if make_gif else None,
+    return {"gif": save_path if make_gif else None,
             "frames": frame_paths,
             "t_contact": t_contact, "t_settle": t_settle, "n_frames": L}
-
-
-# ======================================================================
-# Standalone use:  python visualize_force_model.py
-# ======================================================================
-if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    DATA_FOLDER = os.path.join(script_dir, "data/mojoco_paper_replica_0_wind")
-    MODEL_FOLDER = os.path.join(script_dir, "models/force_stage1")
-    MODEL_PREFIX = None          # None -> auto-detect the single "*_norms.pt" in MODEL_FOLDER
-    TRAJECTORY = 460             # which trajectory to animate
-    WEIGHTS_ONLY = False
-    UNSCALE = False
-
-    SAVE_PATH = os.path.join(MODEL_FOLDER, f"force_rollout_{TRAJECTORY}.gif")
-    SHOW = True                  # also open the interactive window
-    INTERVAL = 50                # ms per frame (GIF fps = 1000 // INTERVAL)
-
-    # --- arrow appearance ---
-    MG_ARROW_WIDTHS = 1.0        # a force of m*g draws this many block-widths long
-    NORMAL_GAIN  = 1.0           # per-channel display gain on top of the physical scale
-    TANGENT_GAIN = 8.0           # friction is ~mu*mg/n_contact_nodes -- unreadable at 1.0
-    FLUID_GAIN   = 1.0
-    MIN_ARROW_FRAC = 0.002       # was 0.01, which culled per-node friction in slow frames
-    DRAW_FLOOR = True
-    DRAW_GROUND_TRUTH = True
-
-    C_NORMAL, C_TANGENT, C_FLUID = "tab:green", "tab:orange", "magenta"
-
-    # save_frames="auto"  picks the event frames and writes each one as a
-    # separate vector PDF. Pass a list instead to choose them yourself, e.g.
-    # save_frames=[12, 34, 41, 78]. make_gif=False skips the animation.
-    out = visualize_force_rollout(MODEL_FOLDER, DATA_FOLDER, TRAJECTORY,
-                                  model_prefix=MODEL_PREFIX, save_path=SAVE_PATH,
-                                  show=SHOW, weights_only=WEIGHTS_ONLY,
-                                  unscale=UNSCALE, interval=INTERVAL,
-                                  mg_arrow_widths=MG_ARROW_WIDTHS,
-                                  min_arrow_frac=MIN_ARROW_FRAC,
-                                  draw_floor=DRAW_FLOOR,
-                                  draw_ground_truth=DRAW_GROUND_TRUTH,
-                                  tangent_gain=TANGENT_GAIN,
-                                  save_frames="auto", n_panels=6,
-                                  frame_format="pdf", make_gif=True)
-    print(out)

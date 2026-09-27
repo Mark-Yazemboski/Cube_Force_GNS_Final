@@ -1,13 +1,11 @@
 """
-force_gns.py  (v2 - COM fluid head)
-
-NEW FILE - does not modify any existing code.
+force_gns.py
 
 The force-based version of the GNS model plus the rigid-body dynamics layer
 that turns forces into motion. Training supervision is unchanged (position
 error only) - the model is never shown a force label.
 
-WHAT THE MODEL OUTPUTS (the v2 change):
+WHAT THE MODEL OUTPUTS:
   - CONTACT: per-node forces, gated by a geometric contact indicator. Only
     nodes near the floor can exert contact force. Tangential + softplus normal
     (normal can push, never pull -> non-penetration is architectural).
@@ -52,13 +50,10 @@ Mass and dt cancel out of the contact-torque term; only the radius of
 gyration (I/m = s^2/6) enters.
 """
 
-import math
 import torch
 import torch.nn as nn
 
-# Same geometry constants as the rest of the codebase
-BLOCK_HALF_WIDTH = 0.0524
-BLOCK_WIDTH = 2.0 * BLOCK_HALF_WIDTH
+from generate_node_states import BLOCK_WIDTH
 
 # Solid cube inertia over mass: I/m = s^2 / 6, identical about every axis.
 # Isotropic inertia => w x (I w) = I_scalar * (w x w) = 0 exactly.
@@ -125,9 +120,8 @@ def so3_log(R):
 
 
 # ======================================================================
-# GNS encoder / processor - mirrors GNSLayer in train_gnn_multi_step.py.
-# Copied (not imported) so this module stays standalone and unit-testable
-# without pulling in torch_geometric. The math is identical.
+# GNS encoder / processor - same GNSLayer math as the acceleration model,
+# written with plain tensors (no torch_geometric).
 # ======================================================================
 
 class GNSLayer(nn.Module):
@@ -180,11 +174,10 @@ class ForceGNSModel(nn.Module):
     N_CONTACT_OUT = 4
     N_FLUID_OUT = 6
 
-    def __init__(self, node_in_dim, edge_in_dim, latent_dim=128, L=5, K=1,
+    def __init__(self, node_in_dim, edge_in_dim, latent_dim, L, K,
                  normal_bias_init=-2.0):
         super().__init__()
         self.K = K
-        self.L = L
         self.node_encoder = nn.Sequential(
             nn.Linear(node_in_dim, latent_dim),
             nn.ReLU(),
@@ -236,7 +229,7 @@ class ForceGNSModel(nn.Module):
 # Output assembly
 # ======================================================================
 
-def contact_weight(dist, d0=0.02, tau=0.005):
+def contact_weight(dist, d0, tau):
     """Soft geometric contact indicator (1 = contact, 0 = free). Not learned:
     contact detection for a cube on a flat floor is trivial geometry, and
     fixing it removes a failure mode while the force representation is
@@ -256,7 +249,7 @@ def assemble_contact_forces(contact_raw, c_w, wall_normal, scale_vec):
                  acceleration-target stats (equal x/y keeps the scaling
                  z-rotation equivariant, so the rotation augmentation is valid)
 
-    Returns phi_c (B, N, 3) per-node contact specific force, and a parts dict.
+    Returns phi_c (B, N, 3), the per-node contact specific force.
     """
     n_hat = wall_normal / wall_normal.norm().clamp_min(1e-12)
     t_raw = contact_raw[..., 0:3]
@@ -277,11 +270,7 @@ def assemble_contact_forces(contact_raw, c_w, wall_normal, scale_vec):
     s_n = (scale_vec * n_hat).norm()
     n_mag = torch.nn.functional.softplus(n_raw) * s_n
 
-    phi_c = c_w * (t_vec + n_mag * n_hat)
-    parts = {"phi_contact": phi_c,
-             "normal_mag": n_mag,
-             "contact_weight": c_w}
-    return phi_c, parts
+    return c_w * (t_vec + n_mag * n_hat)
 
 
 def fluid_wrench_from_raw(fluid_raw, scale_vec, ang_scale_vec):
