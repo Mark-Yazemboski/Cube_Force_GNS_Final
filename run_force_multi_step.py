@@ -16,8 +16,10 @@ from generate_node_states import BLOCK_HALF_WIDTH
 from physics_losses import summarize_diagnostics, reset_diagnostics
 
 
+#Setting that just ensures high precision for matrix multiplications in float32
 torch.set_float32_matmul_precision('high')
 
+#Gets the current script directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Sets where our floor/wall is located. This is so the model knows hwo far each node is form the floor
@@ -62,7 +64,7 @@ print(f"Validation range: {val_range}")
 print(f"Test range: {test_range}")
 
 # ----------------------------------------------------------------------
-# Architecture / recipe (matches the current best acceleration recipe)
+# Architecture / recipe
 # ----------------------------------------------------------------------
 nodes_per_edge = 2
 K_nearest_neighbors = 3
@@ -144,81 +146,71 @@ LEARN_MU = True        # recover mu from data (the drag-coefficient story)
                        # (False holds mu fixed at MU_INIT)
 
 
+# Wind feature turns on the wind related information in the node states and allows for the model to predict wind effects.
+use_wind_feature = True        
 
-use_wind_feature = True        # Stage 1: off. Stage 2+: on for wind datasets.
-use_drag_baseline = True        # analytic drag at COM (calibrated k/m); the
-                                # anchor term assumes this is the fluid center
+# Drag baseline makes the model already know that the aerodynamic drag at the cube's center of mass follows the analytic drag law.
+# The model will then only try and learn the residual drag effects beyond the analytic baseline.
+# Having this inabled makes the models prediction of k/m worse.
+use_drag_baseline = False        
+                                
 
-# Loss: "accel" = per-node acceleration MSE, the SAME objective as the
-# acceleration model's _unroll_chain_loss_accel, so the parity comparison is
-# exact and the logged loss number is directly comparable. "position" = the
-# block-width position MSE. Keep "accel" until parity is established.
+# Loss mode determines the main loss type that really enforces the main motion of the cube.
+# The "accel" loss focuses on matching the predicted accelerations to the ground truth, while the 
+# "position" loss focuses on the cube's positional accuracy.
+# Accel performes better for capturing the dynamic response of the cube
 loss_mode = "accel"
 
 # ----------------------------------------------------------------------
-# PHYSICS-INFORMED LOSS (proposal Eq. 5-6; one function per term in
-# physics_losses.py). Raw magnitudes print every epoch - calibrate each
-# gamma so (gamma * raw) is ~1-10%% of the position loss after epoch 1.
-#
-# What the wrench labels showed and which term answers it:
-#   fluid channel carried ~0.2 mg of friction (= mu m g), at every wind level
-#     -> w_fluid_anchor pins fluid to the analytic drag law
-#     -> w_fluid_smooth forbids the jumpy, contact-synchronized compensation
-#        (the chaotic pink arrow) - NEEDS multistep >= 2
-#     -> w_fric_dir / w_fric_mag give the displaced friction a
-#        correctly-structured home: anti-parallel to slip, proportional to
-#        the local normal force, one global mu. mu is LEARNABLE by default,
-#        so the model recovers the friction coefficient the same way it
-#        recovered the drag coefficient (replica ground truth: mu = 0.198).
-#   h_pen needs no weight: normal forces are >= 0 by construction (softplus).
-# --- CONTACT / friction ---------------------------------------------
-# Coulomb friction is enforced as two separate halves (direction, magnitude)
-# rather than one joint residual || phi_t + mu phi_n vhat ||^2: with the joint
-# form a single global mu absorbs any directional error (mu -> mu_true * <cos>;
-# measured here: mu_param 0.156 vs mu_implied 0.216, ~44 deg of misalignment).
-w_fric_dir = .3       # gamma_1a : direction half - fixes crossing arrows
-w_fric_mag = .1       # gamma_1b : magnitude half - mu's ONLY gradient path
-w_fric_cone= 1.5       # gamma_1c : ||phi_t|| <= mu phi_n, STATIC regime too
+# PHYSICS-INFORMED LOSS 
+
+# --- FRICTION -----------------------------------------------------------
+
+w_fric_dir = .3       #direction: Enforces the correct orientation of the friction force relative to the slip direction
+w_fric_mag = .1       #magnitude: Enforces the friction forces to follow Coulomb's law
+w_fric_cone= 1.5       #Cone: Enforces the friction force to lie within the Coulomb friction cone
 
 # --- FLUID -----------------------------------------------------------
-# The anchor ladder (Aug 28-29, 3 seeds/cell) was monotonic with no motion
-# cost: fluid_err_contact 0.1368 -> 0.0479 mg from w=0 to w=1e-1, 65% down,
-# center error flat within the baseline spread. It had NOT plateaued at 1e-1.
-w_fluid_anchor = 3e-2  # gamma_3a: fluid FORCE == analytic drag law
-w_fluid_smooth = 3e-2  # gamma_3b: fluid force smooth in time (K >= 2 only)
+
+w_fluid_anchor = 3e-2  #Fluid anchor: Enforces the fluid force to stay near the analytic drag law
+w_fluid_smooth = 3e-2  #Fluid smooth: Enforces the fluid force to vary smoothly in time (K >= 2 only)
 
 
 
-# ----------------------------------------------------------------------
-# Naming / paths
-# ----------------------------------------------------------------------
-extra_name = "force_phys_loss_zero_Weight"      # CHANGE PER EXPERIMENT
-model_folder_path = os.path.join(script_dir, "models", extra_name)
+#Where you set the run name and model folder paths for what and where you want the model to be saved.
+run_name = "force_phys_loss_zero_Weight"      
+model_folder_path = os.path.join(script_dir, "models", run_name)
 os.makedirs(model_folder_path, exist_ok=True)
 save_model_path = os.path.join(
     model_folder_path, f"{Used_Num_train_trajectories}_force_gns_model.pt")
 
-# Everything runs from this one file so a single batch job on ROAR trains,
-# evaluates, and renders the GIFs without a second submission.
+
+# Flags to control the training, evaluation, and visualization of the model.
 Train_model = True
 Evaluate_model = True
 Visualize_model = True
 
-# Which test trajectories to render as GIFs. Keep this short - each one is a
-# full rollout plus a matplotlib animation, so ~10-30 s apiece.
-VISUALIZE_TRAJECTORIES = [test_range[0], test_range[len(test_range) // 2]]
-VISUALIZE_SHOW = False          # False on a compute node (no display)
 
-# One canonical row per force run, kept in its OWN master file so the force
-# architecture's numbers never get mixed into the acceleration model's
-# all_runs_master.csv. Opens directly in Excel.
+# Trajectory numbers that will be visualized into GIFsduring the evaluation.
+VISUALIZE_TRAJECTORIES = [test_range[0], test_range[len(test_range) // 2]]
+
+#Flag to actually show the GIFS after they are generated (Gifs are always saved, this just controls display)
+VISUALIZE_SHOW = False
+
+# Flag to save a run report and specify the master CSV file for all runs.
 Save_run_report = True
-FORCE_MASTER_CSV = os.path.join(script_dir, "models", "all_force_runs_master.csv")
+master_excel_file_name = "all_force_runs_master.csv"
+FORCE_MASTER_CSV = os.path.join(script_dir, "models", master_excel_file_name)
 
 # ----------------------------------------------------------------------
+
+#If the training flag is set, train the model.
 if Train_model:
+
     # Clear the diagnostic buffers in case several trainings share a process.
     reset_diagnostics()
+
+    #Train the force GNN model with the specified parameters.
     train_force_gnn(
         Wall=Floor,
         train_range=train_range,
@@ -260,11 +252,28 @@ if Train_model:
         keep_last_n_checkpoints=keep_last_n_checkpoints,
     )
 
+
 # ----------------------------------------------------------------------
+#If the evaluation flag is set, evaluate the model.
 if Evaluate_model:
     print("\n" + "#" * 70)
     print("# EVALUATION")
     print("#" * 70)
+
+    # Evaluate the trained force GNN model on the test set.
+    # Always returned: center_error, angle_error_deg, floor_penetration,
+    # center_error_std, angle_error_std, floor_penetration_std,
+    # phase_center [airborne, contact, settled],
+    # phase_angle [airborne, contact, settled], n_test, have_wrench_labels.
+    # With wrench labels, also returned:
+    #   impulse_timing_fraction[_std], impulse_E_frame_over_signal[_std],
+    #   impulse_E_total_over_signal[_std], impulse_n_traj (when available);
+    #   force_contact_err_{airborne,contact,settled},
+    #   force_contact_true_{airborne,contact,settled},
+    #   force_fluid_err_{airborne,contact,settled},
+    #   force_fluid_true_{airborne,contact,settled} (for phases with samples);
+    #   force_{contact,fluid}_{rms_true,rms_err,err_over_signal}, and
+    #   force_{contact,fluid}_r2 (when the true signal has nonzero variance).
     metrics = evaluate_force_model(
         model_folder=model_folder_path,
         data_folder=trajectory_folder,
@@ -273,26 +282,39 @@ if Evaluate_model:
         unscale=unscale_trajectory_data,
     )
 
-    # Mean over the last 20 epochs of the per-epoch diagnostics that
-    # slip_gate_report() recorded during training (one per epoch, from that
-    # epoch's first batch): friction alignment, mu_implied, slip-gate
-    # occupancy. These are the metrics the friction sweep is ranked on, so
-    # they belong in the same CSV row as force_contact_err_contact instead of
-    # only in the log. Averaged, not final-value: one batch is noisy.
-    # Empty when this process did not train (Train_model = False).
+    # summarize_diagnostics returns the following keys from the last 20
+    # slip_gate_report records (one record per epoch, from its first batch):
+    #   diag_align, diag_align_std: mean friction/slip anti-alignment cosine
+    #     and its standard deviation; +1 means friction opposes slip.
+    #   diag_misalign_deg: angle from perfect anti-alignment, computed from
+    #     the mean cosine (not the mean of per-epoch angles).
+    #   diag_mu_implied, diag_mu_implied_std: implied Coulomb mu from predicted
+    #     forces, mean and standard deviation.
+    #   diag_gate_frac: mean contact-weight fraction admitted by the slip gate.
+    #   diag_cancel_slide, diag_cancel_static: mean friction-force
+    #     cancellation fraction in sliding and static branches.
+    #   diag_n_epochs: number of records included in the tail.
+    # These values are merged into metrics
+    # and therefore included in the run report when one is saved.
     diagnostics = summarize_diagnostics(last_n=20)
     metrics.update({k: float(v) for k, v in diagnostics.items()})
 
-    # Recovered mu / k/m, their traces, and the converged training loss, read
-    # from the checkpoints training wrote. Never fail a finished run over
-    # reporting.
-    try:
-        metrics.update(collect_run_diagnostics(save_model_path))
-    except Exception as e:
-        print(f"  checkpoint diagnostics unavailable: {e}")
 
+    # collect_run_diagnostics returns optional keys from the saved checkpoints:
+    #   recovered_mu, recovered_k_over_m: final values from the physics file.
+    #   final_train_loss, final_train_loss_std, final_train_loss_n: mean,
+    #     standard deviation, and finite-value count over the last 20 losses.
+    #   best_val_loss, best_val_epoch, total_optimizer_steps: values saved in
+    #     the loss-history file, when present.
+    #   mu_init / k_init, mu_drift / k_drift, and
+    #     mu_tail_slope_per_1k_ep / k_tail_slope_per_1k_ep: initial trace value,
+    #     end-minus-start change, and slope over the last 10% of each trace.
+    metrics.update(collect_run_diagnostics(save_model_path))
+
+    # print a summary of the collected metrics
     print("\nSummary:", {k: (round(v, 4) if isinstance(v, float) else v)
                          for k, v in metrics.items()})
+
 
     if Save_run_report:
         print("\nEnd-of-run diagnostics (mean of last "
@@ -300,8 +322,9 @@ if Evaluate_model:
         for k, v in sorted(diagnostics.items()):
             print(f"    {k:<22} {v:.6g}")
 
+        # saves the runs settings into a dictionary
         settings = dict(
-            architecture="force",           # distinguishes these rows at a glance
+            architecture="force",           
             dataset=trajectory_folder,
             n_train=Used_Num_train_trajectories,
             train_range=f"{train_range.start}-{train_range.stop}",
@@ -333,16 +356,21 @@ if Evaluate_model:
             w_fluid_smooth=w_fluid_smooth,
             learn_mu=LEARN_MU,
         )
+
+        # saves the run report to excel
         save_run_report(model_folder_path, settings, metrics,
-                        run_name=extra_name, master_csv=FORCE_MASTER_CSV)
+                        run_name=run_name, master_csv=FORCE_MASTER_CSV)
 
 # ----------------------------------------------------------------------
+#Visualizes the trajectories you specify in VISUALIZE_TRAJECTORIES, and the modeles predictions of them
 if Visualize_model:
     print("\n" + "#" * 70)
     print("# VISUALIZATION")
     print("#" * 70)
     for traj_idx in VISUALIZE_TRAJECTORIES:
         try:
+            # visualize the rollout for the current trajectory index
+            # Saving and showing the visualization happens in the function itself
             out = visualize_force_rollout(
                 model_folder=model_folder_path,
                 data_folder=trajectory_folder,
