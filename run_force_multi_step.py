@@ -126,8 +126,14 @@ GRAVITY = None          # None -> read from replica_physics in the data (9.615)
 
 MASS = 0.37             # Mass of the cube
 
-contact_d0 = 0.02               # soft geometric contact gate center (m)
-contact_tau = 0.005             # gate width (m)
+# Soft geometric contact gate applied independently to each cube node.
+# contact_d0 is the distance where the contact weight is 0.5; contact_tau
+# controls how gradually the weight changes with distance. The resulting
+# weight scales the predicted contact force and friction-loss contributions.
+# These parameters detect proximity to the surface, not static vs. sliding;
+# that distinction uses the separate slip-speed gate in train_force_gns.py.
+contact_d0 = 0.02               # 50% contact weight at this distance (m)
+contact_tau = 0.005             # distance softness of the transition (m)
 
 
 

@@ -1,69 +1,8 @@
 """
 physics_losses.py
 
-The physics-informed violation losses from the proposal (Eq. 5-6), mapped
-onto the force architecture. Each term is its own function so it can be
-explained, ablated, and weighted independently.
-
-======================================================================
-MAPPING FROM THE PROPOSAL TO THIS IMPLEMENTATION
-======================================================================
-
-Proposal Eq. (5) has three terms. Where each one lives here:
-
-  h_diss   "frictional forces must maximize power loss"
-           -> The proposal's expression || ||J_t v'|| lam_t + lam_n J_t v' ||
-              is zero exactly when the tangential impulse is anti-parallel to
-              slip with magnitude tied to the normal impulse - i.e. kinetic
-              Coulomb friction phi_t = -mu * phi_n * v_hat. We enforce that
-              zero-set in two halves (see SPLIT COULOMB below):
-                h_friction_direction():  friction opposes the node's slip
-                h_friction_magnitude():  ||phi_t|| = mu * phi_n
-              with mu EXPLICIT and (by default) LEARNABLE, so the model
-              recovers the friction coefficient as a byproduct - the same
-              "recovered the physical parameter" story as the drag
-              coefficient. Both are gated on slip speed: static friction may
-              sit anywhere inside the cone, so the equality applies only
-              while sliding. h_friction_cone() adds the static-regime bound.
-
-  h_pen    "contact impulses must remain non-negative"
-           -> ARCHITECTURAL. The normal force goes through a softplus in
-              force_gns.py, so min(0, phi_n)^2 == 0 by construction. There is
-              no loss term because violation is impossible, not merely
-              discouraged. gamma_2 is not needed.
-
-  h_smooth "regularize the predicted fluid forces ... to promote smooth
-            fluid force distributions"
-           -> Two terms, because our fluid head is a single COM wrench, not a
-              per-node field (see force_gns.py for why):
-              (a) h_fluid_anchor():   the fluid force should match the
-                  ANALYTIC drag law k|u|u evaluated at the measured relative
-                  wind. This is the physics-infused version of "regularize
-                  the fluid forces": shrink toward the law, not toward zero.
-              (b) h_fluid_temporal_smooth(): the fluid wrench must vary
-                  SMOOTHLY IN TIME. Drag is a smooth function of relative
-                  wind, which changes slowly; contact events are the jumpy
-                  thing. With space collapsed to a point, "smooth
-                  distribution" becomes smoothness along the trajectory.
-                  Requires multistep >= 2 (needs consecutive predictions).
-
-Overall loss (Eq. 6):  L = L_pred + sum_j gamma_j h_j
-The gammas are the w_* weights in run_force_multi_step.py.
-
-======================================================================
-WHY THESE TERMS, GIVEN WHAT WE MEASURED
-======================================================================
-The wrench-label evaluation showed the failure precisely: the fluid channel
-carries a ~0.2 mg force during contact - the size of the friction force
-mu*m*g - identically at every wind level, while free-flight drag is predicted
-well. The loss only observes the net wrench (6 numbers) but the model outputs
-30, so the split is underdetermined and the optimizer parks friction in the
-easiest channel. These terms remove that degeneracy from both sides:
-h_fluid_anchor pins what fluid IS ALLOWED to be (the drag law),
-h_fluid_temporal_smooth pins how it may CHANGE (slowly), and the Coulomb
-terms give the displaced friction a correctly-structured home in the contact
-channel (anti-parallel to slip, proportional to local normal force, one
-global mu).
+This file hold all of the different physics loss terms used in training the force GNN.
+It also holds the diagnostic history and provides utility functions for summarizing it.
 
 ======================================================================
 NORMALIZATION
@@ -90,116 +29,123 @@ import torch.nn as nn
 
 
 # ======================================================================
-# DIAGNOSTIC HISTORY  (module-level, so the run script can read it after
-# train_force_gnn returns without the trainer having to hand it back)
+# DIAGNOSTIC HISTORY
 # ----------------------------------------------------------------------
-# slip_gate_report() appends to DIAG_HISTORY on every call - once per epoch,
-# on the epoch's first batch - so the alignment / mu_implied /
-# gate-occupancy trace accumulates for free. Each epoch's numbers come from
-# ONE batch and are noisy (measured spread: alignment 0.726 +/- 0.094, with a
-# 0.503 outlier), so summarize_diagnostics() averages the tail rather than
-# reporting the last value.
+# A process-local, bounded history of diagnostic snapshots produced by
+# PhysicsLosses.slip_gate_report(). The trainer records one snapshot from
+# the first batch of each reported epoch; this is separate from the loss
+# history and is never used to compute gradients or update the model.
+#
+# Each snapshot is a dictionary containing:
+#   - slip-gate coverage and counterfactual coverage at lower thresholds
+#   - contact-node slip-speed percentiles and the configured gate parameters
+#   - friction coefficient implied by the predicted forces and learned mu
+#   - friction/slip alignment, misalignment angle, and force cancellation
+#     for sliding and static contact
+#   - contact weight/count and the optional timestep used for unit conversion
+#
+# The deque keeps only the newest 200 snapshots. summarize_diagnostics()
+# normally averages the newest 20 snapshots for the run report, while
+# reset_diagnostics() clears the history before a new training run.
 # ======================================================================
-DIAG_HISTORY = deque(maxlen=200)
+PHYSICS_DIAGNOSTIC_HISTORY = deque(maxlen=200)
 
 
+#Clears the physics diagnostic history buffer. 
 def reset_diagnostics():
-    """Clear the buffer. Call at the start of a run if several trainings
-    share one Python process."""
-    DIAG_HISTORY.clear()
+    PHYSICS_DIAGNOSTIC_HISTORY.clear()
 
 
+#Summarizes the physics diagnostic history buffer.
+#Returns a flat dict of floats averaged over the last `last_n` recorded epochs.
+#Tracks data like mean alignment, implied friction coefficient, gate fraction,
+#force cancellation for sliding and static contact, and the number of recorded epochs.
 def summarize_diagnostics(last_n=20):
-    """Mean over the last `last_n` recorded epochs, for the run report.
 
-    Returns a flat dict of floats ready to drop into the settings dict.
-    An empty buffer gives an empty dict, so this is safe to call unconditionally.
-    misalign_deg is arccos(mean align), NOT the mean of the per-epoch angles:
-    arccos is nonlinear, so averaging degrees would bias the result.
-    """
     out = {}
-    if DIAG_HISTORY:
-        tail = list(DIAG_HISTORY)[-last_n:]
+    if PHYSICS_DIAGNOSTIC_HISTORY:
+
+        # Extract the last `last_n` snapshots from the diagnostic history.
+        tail = list(PHYSICS_DIAGNOSTIC_HISTORY)[-last_n:]
         al = np.array([r["mean_align"] for r in tail], dtype=float)
         mi = np.array([r["mu_implied"] for r in tail], dtype=float)
         gf = np.array([r["gate_frac"] for r in tail], dtype=float)
+
+        # Remove any non-finite values to avoid NaNs in the summary.
         al, mi, gf = al[np.isfinite(al)], mi[np.isfinite(mi)], gf[np.isfinite(gf)]
+
+
         if al.size:
+            # Compute the mean alignment and its standard deviation.
             m = float(al.mean())
             out["diag_align"] = m
             out["diag_align_std"] = float(al.std(ddof=1)) if al.size > 1 else 0.0
             out["diag_misalign_deg"] = float(
                 np.degrees(np.arccos(min(1.0, max(-1.0, m)))))
         if mi.size:
+            # Compute the mean implied friction coefficient and its standard deviation.
             out["diag_mu_implied"] = float(mi.mean())
             out["diag_mu_implied_std"] = float(mi.std(ddof=1)) if mi.size > 1 else 0.0
         if gf.size:
+            # Compute the mean gate fraction.
             out["diag_gate_frac"] = float(gf.mean())
         for key in ("cancel_slide", "cancel_static"):
+            # Compute the mean force cancellation for sliding and static contact.
             v = np.array([r.get(key, np.nan) for r in tail], dtype=float)
             v = v[np.isfinite(v)]
+
+            # Remove any non-finite values to avoid NaNs in the summary.
             if v.size:
                 out[f"diag_{key}"] = float(v.mean())
+
+        # Record the number of epochs included in the summary.
         out["diag_n_epochs"] = len(tail)
     return out
 
 
+# PhysicsLosses module: encapsulates the physics-loss state and exposes methods for each violation term.
 class PhysicsLosses(nn.Module):
-    """Holds the physics-loss state (the friction coefficient mu and the drag
-    coefficient k/m) and exposes one method per violation term. Instantiate
-    once in training, move to the device, and include .parameters() in the
-    optimizer.
 
-    mu modes (k/m works the same way with k_init / learn_k):
-      learn_mu = True   -> mu is a learnable parameter (init mu_init),
-                           recovered from data. Parameterized as log(mu) so
-                           it stays positive.
-      learn_mu = False  -> mu is held fixed at mu_init.
-    """
-
+    # Initialize the physics-loss module with the given parameters.
     def __init__(self, phi_g, ang_scale_vec, mu_init, learn_mu, k_init, learn_k,
                  slip_v0, slip_tau, eps=1e-9):
         super().__init__()
         self.register_buffer("phi_g", torch.as_tensor(float(phi_g)))
         self.register_buffer("ang_scale_vec",
                              torch.as_tensor(ang_scale_vec, dtype=torch.float32))
+
+        # Convert the initial friction coefficient to log-space for stability and potential learning.
         log_mu = torch.log(torch.tensor(float(mu_init)))
         if learn_mu:
             self.log_mu = nn.Parameter(log_mu)
         else:
             self.register_buffer("log_mu", log_mu)
 
-        # k/m, the quadratic drag coefficient, gets exactly the same treatment
-        # as mu: log-space so it stays positive by construction, learnable so
-        # the pipeline carries no constant fitted offline against MuJoCo.
-        # Identification is the mirror of mu's: the prediction loss determines
-        # the fluid force, and the analytic drag law reads the coefficient off
-        # it. With use_drag_baseline=False the anchor makes that an explicit
-        # least-squares fit, k* = sum(a.w)/sum(w.w) with w = ||u||u, which is a
-        # one-parameter regression on a single basis function - unbiased at
-        # 100% noise on the fluid head in simulation. With the baseline ON the
-        # anchor reduces to ||residual||^2 and k cancels out of it, so k is
-        # identified only through the prediction loss and only insofar as the
-        # anchor suppresses the residual. Baseline OFF is the clean case.
+        
+        # Convert the initial drag coefficient to log-space for stability and potential learning.
+        # to better learn k/m, baseline should be turned off.
         log_k = torch.log(torch.tensor(float(k_init)))
         if learn_k:
             self.log_k = nn.Parameter(log_k)
         else:
             self.register_buffer("log_k", log_k)
 
-        self.slip_v0 = slip_v0        # m/step: slip-speed gate center
-        self.slip_tau = slip_tau      # m/step: gate softness
+        
+        # Tangential-speed gate: low speeds are treated as static contact and
+        # high speeds as sliding contact. slip_v0 is the 50% transition speed;
+        # slip_tau controls how sharply the sigmoid changes between regimes.
+        self.slip_v0 = slip_v0        # transition speed (m/step)
+        self.slip_tau = slip_tau      # transition softness (m/step)
         self.eps = eps
 
     @property
+    # Returns the friction coefficient mu
     def mu(self):
         return torch.exp(self.log_mu)
 
     @property
+    # Returns the quadratic drag coefficient k/m
     def k_over_m(self):
-        """Quadratic drag coefficient k/m, as a tensor. drag_accel_step()
-        multiplies by it, so passing this instead of a float is all that is
-        needed to put k in the graph."""
         return torch.exp(self.log_k)
 
     @torch.no_grad()
@@ -217,21 +163,42 @@ class PhysicsLosses(nn.Module):
         compute_step_terms. dt (s) is optional and only converts the
         m/step figures to m/s for readability.
         """
+
+        # Detach the velocity to avoid gradients flowing through it
         v = v_node.detach()
+
+        # Tangential velocity relative to the wall normal
         v_t = v - (v * wall_n).sum(-1, keepdim=True) * wall_n
         speed = v_t.norm(dim=-1, keepdim=True)                 # (B,N,1) m/step
+
+        # Unit vector in the direction of tangential velocity
         v_hat_d = v_t / (speed + self.eps)
+
+        # Slip gate: sigmoid that transitions from static to sliding based on tangential speed
         gate = torch.sigmoid((speed - self.slip_v0) / self.slip_tau)
 
+        # Detach the contact weight to avoid gradients flowing through it
         w_c = c_w.detach()
-        contact_mass = w_c.sum().clamp_min(self.eps)
-        # This ratio IS the multiplier on the sliding terms' effective size.
-        gate_frac = float((w_c * gate).sum() / contact_mass)
 
-        # Slip-speed distribution over nodes that are actually in contact,
-        # which is the population the gate is deciding about.
+        # Total soft contact weight across the batch. This is the denominator
+        # for contact-weighted sliding fractions; it is not physical mass.
+        total_contact_weight = w_c.sum().clamp_min(self.eps)
+
+        # Fraction of total contact weight classified as effectively sliding
+        gate_frac = float((w_c * gate).sum() / total_contact_weight)
+
+        #Sees only the nodes that are actually in contact. This filters out nodes
+        #with negligible contact weight, focusing the slip-speed statistics on
+        #the relevant population.
         in_contact = (w_c > 0.5).squeeze(-1)
+
+        # Extract the slip speeds of nodes that are actually in contact.
         s = speed.squeeze(-1)[in_contact]
+
+        # Compute the slip-speed percentiles for the in-contact nodes.
+        # If there are no in-contact nodes, return NaN for all percentiles.
+        # Basically, we are computing the 10th, 50th, 90th, and 99th percentiles
+        # of the slip speed for the nodes that are actually in contact.
         if s.numel() == 0:
             pct = {q: float('nan') for q in (10, 50, 90, 99)}
         else:
@@ -240,24 +207,37 @@ class PhysicsLosses(nn.Module):
             vals = torch.quantile(s, qs)
             pct = {q: float(x) for q, x in zip((10, 50, 90, 99), vals)}
 
-        # Counterfactuals: what would gate_frac be at a lower threshold?
-        # This is the number that decides whether slip_v0 is the real knob.
+        # This will record the counterfactual contact fractions at lower slip thresholds.
+        # to basically see how the contact fraction would change if we used
+        # a lower slip threshold.
         cf = {}
         for div in (3.0, 10.0, 30.0):
             g2 = torch.sigmoid((speed - self.slip_v0 / div) / self.slip_tau)
-            cf[div] = float((w_c * g2).sum() / contact_mass)
+            cf[div] = float((w_c * g2).sum() / total_contact_weight)
+
+
 
         # mu implied by the model's OWN predicted forces on sliding nodes.
         # Coulomb says ||phi_t|| = mu * phi_n while sliding, so this is the
         # mu the force decomposition is currently consistent with -
         # independent of the learnable mu parameter.
+
+        # Compute the normal and tangential components of the contact force.
         phi_n = (phi_contact.detach() * wall_n).sum(-1, keepdim=True)
         phi_t = phi_contact.detach() - phi_n * wall_n
+
+        # Weight the tangential force by the contact gate for later calculations.
         wg = w_c * gate
+
+        # Compute the magnitude of the tangential force for each contact node.
         mag = phi_t.norm(dim=-1, keepdim=True)
+
+        # Compute the implied coefficient of friction based on the weighted tangential and normal forces.
         num = (wg * mag).sum()
         den = (wg * phi_n.clamp_min(0.0)).sum()
         mu_implied = float(num / den) if float(den) > self.eps else float('nan')
+
+
 
         # DIRECTIONAL alignment, measured directly instead of inferred from
         # the mu_param/mu_implied ratio. +1 = friction exactly opposes slip
@@ -271,22 +251,39 @@ class PhysicsLosses(nn.Module):
         # nothing). The prediction loss sees only the net, so a cancelling
         # field is free; and in the STATIC branch every other term is gated
         # off, so nothing else measures this at all.
+
+        # section for computing cancellation fractions per branch.
+        # basic idea: cancellation fraction measures how much the 
+        # tangential forces cancel each other out within each branch.
         def _cancel(weight):
-            num = (weight * phi_t).sum(dim=1).norm(dim=-1)      # ||sum||
-            den = (weight * mag).sum(dim=1).squeeze(-1)         # sum|| ||
+
+            # Compute the numerator and denominator for the cancellation fraction.
+            # numerator: ||sum(weighted tangential forces)||
+            # denominator: sum(||weighted tangential forces||)
+            num = (weight * phi_t).sum(dim=1).norm(dim=-1)      
+            den = (weight * mag).sum(dim=1).squeeze(-1)        
+
+            # Avoid division by zero by checking if the denominator is greater than a small epsilon.
             ok = den > self.eps
             if not bool(ok.any()):
                 return float('nan')
+
+            # Compute the cancellation fraction as 1 - ||sum|| / sum||, averaged over valid branches.
             return float((1.0 - num[ok] / den[ok]).mean())
 
+        # Compute cancellation fractions for sliding and static branches.
         cancel_slide = _cancel(w_c * gate)
         cancel_static = _cancel(w_c * (1.0 - gate))
 
+        # section for computing friction alignment.
         align = -(phi_t * v_hat_d).sum(-1, keepdim=True) / (mag + self.eps)
+
+        # Compute the weighted mean alignment of the tangential forces with the sliding direction.
         wgm = wg * mag
         mean_align = (float((wgm * align).sum() / wgm.sum())
                       if float(wgm.sum()) > self.eps else float('nan'))
 
+        # Prepare the report dictionary with all relevant metrics.
         report = dict(gate_frac=gate_frac,
                       slip_v0=float(self.slip_v0),
                       slip_tau=float(self.slip_tau),
@@ -297,19 +294,30 @@ class PhysicsLosses(nn.Module):
                       misalign_deg=float(np.degrees(np.arccos(
                           min(1.0, max(-1.0, mean_align)))))
                       if mean_align == mean_align else float('nan'),
-                      n_contact_nodes=float(contact_mass), dt=dt)
-        DIAG_HISTORY.append(report)
+                      n_contact_nodes=float(total_contact_weight), dt=dt)
+
+        # Append the report to the global diagnostic history and return it.
+        PHYSICS_DIAGNOSTIC_HISTORY.append(report)
+
         return report
 
     @staticmethod
+    # Format the slip-gate report for logging.
     def fmt_slip_gate_report(r):
-        """The slip-gate block of the epoch log."""
+
+        # Extract the time step and prepare conversion functions for velocity units.
         dt = r["dt"]
+
+        # Determine the conversion factor for velocities based on the time step.
         to_ms = (lambda x: x / dt) if dt else (lambda x: float('nan'))
         u = "m/s" if dt else "m/step"
         conv = to_ms if dt else (lambda x: x)
+
+        # Extract the percentile and counterfactual data from the report.
         p = r["pct"]
         cf = r["counterfactual"]
+
+        # Begin constructing the formatted string for the slip-gate report.
         return (
             f"  Slip gate | OPEN {r['gate_frac']:6.1%} of contact weight  "
             f"| v0={conv(r['slip_v0']):.3f} {u}  "
@@ -325,220 +333,187 @@ class PhysicsLosses(nn.Module):
             f"static {r['cancel_static']:.3f}   (0 = forces pull together, "
             f"1 = they cancel to nothing)"
         )
-
+    
+    #====================================================================================================================================
+    #PHYSICS LOSSES 
 
     # ==================================================================
-    # SPLIT COULOMB
+    # DIRECTION HALF OF COULOMB FRICTION
     # ------------------------------------------------------------------
-    # Why two halves instead of one joint residual: minimizing
-    # || phi_t + mu phi_n vhat ||^2, one squared residual over a VECTOR,
-    # couples magnitude and direction through a single global scalar, and mu
-    # can only absorb the coupling one way:
-    #
-    #     mu*  =  -sum w phi_n (phi_t . vhat) / sum w phi_n^2
-    #          =  mu_true * <cos(misalignment)>
-    #
-    # Verified numerically: at 44 deg of misalignment the joint term reports
-    # mu = 0.140 where the truth is 0.198, while a magnitude-only term reports
-    # 0.198 at ANY misalignment. Splitting therefore does two things at once:
-    # it de-biases the recovered friction coefficient, and it isolates a term
-    # whose only job is fixing the crossing-arrow defect.
+    # This function computes the directional component of the Coulomb
+    # friction loss, which penalizes misalignment between the tangential
+    # friction force and the slip direction of the node.
     # ==================================================================
     def h_friction_direction(self, phi_contact, c_w, v_node, wall_n):
-        """DIRECTION half of Coulomb: friction opposes THAT node's own slip.
-
-        No mu appears, so alignment error cannot leak into the mu estimate.
-        Correct under spin: each node is compared against its own local slip
-        direction, so the genuine fanning-out of friction on a yawing cube is
-        allowed, unlike a global "all frictions parallel" penalty.
+        """
 
         The per-node cost is  ||phi_t|| * (1 + phi_hat_t . vhat), which is 0
         when friction exactly opposes slip and 2||phi_t|| when it drives it.
         Weighting by magnitude means a large misaimed force is expensive and a
         negligible one is nearly free. LINEAR, not squared: the constant
-        gradient keeps pushing all the way to alignment, the same reason L1
-        drives exact sparsity where L2 only shrinks.
-
-        Returns a scalar in units of phi_g.
+        gradient keeps pushing all the way to alignment.
         """
+
+        # Extract the tangential component of the node's velocity relative to the wall.
         v = v_node.detach()
         v_t = v - (v * wall_n).sum(-1, keepdim=True) * wall_n
+
+        # Compute the speed and direction of the tangential velocity.
         speed = v_t.norm(dim=-1, keepdim=True)
         v_hat = v_t / (speed + self.eps)
+
+        # Compute the slip gate, which smoothly transitions from 0 to 1 as the tangential speed 
+        # exceeds the slip threshold.
         slip_gate = torch.sigmoid((speed - self.slip_v0) / self.slip_tau)
 
+        # Decompose the contact force into normal and tangential components.
         phi_n = (phi_contact * wall_n).sum(-1, keepdim=True)
         phi_t = phi_contact - phi_n * wall_n
+
+        # Compute the magnitude of the tangential force and its misalignment with the slip direction.
         mag = phi_t.norm(dim=-1, keepdim=True)
         misalign = 1.0 + (phi_t * v_hat).sum(-1, keepdim=True) / (mag + self.eps)
 
+        # Compute the weighted misalignment loss.
+        # Basically only counting the nodes that are slipping, as indicated by the slip gate.
         w = (c_w * slip_gate).detach()
+
+        # Return the final weighted misalignment loss, normalized by the total contact weight.
         return (w * (mag / self.phi_g) * misalign).sum() / (c_w.detach().sum() + self.eps)
 
+
+    # ==================================================================
+    # MAGNITUDE HALF OF COULOMB FRICTION
+    # ------------------------------------------------------------------
+    # This function enforces the magnitude half of the Coulomb friction law.
+    # It will penalize deviations of the tangential force magnitude from the 
+    # Coulomb friction limit when sliding.
+    # ==================================================================
     def h_friction_magnitude(self, phi_contact, c_w, v_node, wall_n):
-        """MAGNITUDE half of Coulomb: ||phi_t|| = mu * phi_n while sliding.
-
-        This is mu's ONLY gradient path in the split formulation. Because the
-        direction is excluded, mu converges to the friction coefficient itself
-        rather than to mu * <cos misalignment>, so `recovered mu` becomes a
-        measurement of friction instead of a measurement of friction times
-        alignment.
-
-        Gating: contact weight c_w (geometric) x a soft slip gate
-        sigma((|v_t| - v0)/tau). Static contact (settled cube) is NOT forced
-        to the cone boundary - static friction may be anything inside it.
         """
+        MAGNITUDE half of Coulomb: ||phi_t|| = mu * phi_n while sliding.
+        """
+
+        # Compute the tangential velocity and the slip gate.
         v = v_node.detach()
         v_t = v - (v * wall_n).sum(-1, keepdim=True) * wall_n
         speed = v_t.norm(dim=-1, keepdim=True)
         slip_gate = torch.sigmoid((speed - self.slip_v0) / self.slip_tau)
 
+        # Compute the normal and tangential components of the contact force.
         phi_n = (phi_contact * wall_n).sum(-1, keepdim=True)
         phi_t = phi_contact - phi_n * wall_n
+
+
         # phi_n is DETACHED: Coulomb says what friction may be GIVEN the
         # normal force. Left attached, this residual carries a normal-direction
         # gradient of size mu*|dL/dphi_t|, so the cheapest fix for
         # ||phi_t|| != mu*phi_n is to move phi_n - a well-determined,
         # position-loss-observable quantity - instead of the friction.
         # mu keeps its gradient - this is its only path.
+
+        # Compute the residual for the magnitude half of Coulomb friction.
         resid = (phi_t.norm(dim=-1, keepdim=True)
                  - self.mu * phi_n.detach()) / self.phi_g
 
-        # Normalize by CONTACT weight only; the slip gate lives in the
-        # numerator. If it were in the denominator too, a batch where every
-        # node is equally (barely) gated would cancel the gate entirely and
-        # static contact would be penalized at full strength. The gate is
-        # sharp (tau default 1e-4 m/step) and DETACHED, so sharpness costs no
-        # gradient pathology.
+        # Only consider nodes that are in contact and sliding., and normalize by the contact weight.
         w = (c_w * slip_gate).detach()
         return (w * resid.pow(2)).sum() / (c_w.detach().sum() + self.eps)
 
+
+    
+    # ==================================================================
+    # COULOMB FRICTION CONE
+    # ------------------------------------------------------------------
+    # This function enforces the inequality ||phi_t|| <= mu * phi_n.
+    # Unlike the sliding losses, the cone does not require friction to be
+    # moving or aligned with slip, so it is useful for static contact.
+    # ==================================================================
     def h_friction_cone(self, phi_contact, c_w, v_node, wall_n):
-        """The COULOMB CONE bound  ||phi_t|| <= mu * phi_n.
-
-        The other half of Coulomb friction, and the half that has been missing.
-        h_friction_direction / h_friction_magnitude enforce the SLIDING
-        equality and are therefore gated off below slip_v0 - which leaves the
-        STATIC regime, the
-        settled frames where the rollout jitters, with no constraint on
-        friction whatsoever. The cone is an INEQUALITY, valid in both regimes:
-        it says nothing about direction and only bounds magnitude, so it cannot
-        over-constrain static contact the way the equality would.
-
-        Gated by contact weight and the STATIC side of the slip gate (see
-        below). Satisfied forces cost exactly zero (hinge), so this is free
-        wherever the model is already physical.
-
-        mu is DETACHED here. With gradient, the cheapest way to reduce a hinge
-        penalty is to inflate mu until the constraint is never active, which
-        would destroy the mu measurement that h_friction_magnitude provides.
         """
+        Enforces the Coulomb friction-cone limit on static contact.
+
+        The loss is zero when the tangential force is inside the cone. It
+        penalizes only the amount by which the force exceeds mu * phi_n.
+        """
+
+        # Keep mu fixed for this loss so the model cannot reduce the penalty
+        # by increasing the learned friction coefficient.
         mu = self.mu.detach()
+
+        # Decompose the predicted contact force into normal and tangential parts.
         phi_n = (phi_contact * wall_n).sum(-1, keepdim=True)
         phi_t = phi_contact - phi_n * wall_n
-        # BOTH mu and phi_n are held fixed: the only way to satisfy the cone
-        # is to shrink the offending friction force, not to widen the cone.
+
+        # Positive values violate the cone; values at or below zero are valid.
         excess = phi_t.norm(dim=-1, keepdim=True) - mu * phi_n.detach().clamp_min(0.0)
 
-        # STATIC BRANCH ONLY.
-        #
-        # Complementary slackness has two disjoint branches. On a SLIDING node
-        # the constraint is ACTIVE and h_friction_magnitude enforces the
-        # equality ||phi_t|| = mu phi_n, which already implies the inequality -
-        # the cone is redundant there. On a STATIC node the constraint is
-        # INACTIVE, the equality is switched off by the slip gate, and the cone
-        # is the only law left.
-        #
-        # Applying it to sliding nodes as well is not merely redundant, it is
-        # unstable: the bound sits at a mu that h_friction_magnitude is fitting
-        # from those same forces, so clipping lowers mu, which tightens the
-        # bound, which clips harder. Measured: mu_implied 0.194 -> 0.186 ->
-        # 0.172 as w_fric_cone went 0 -> 0.5 -> 1.5.
-        #
-        # This is the SAME Coulomb cone, restricted to the branch where it is
-        # the operative condition. No margin, no weakened inequality.
+        # Apply the cone to the static side of the slip gate. Sliding nodes are
+        # handled by the direction and magnitude losses instead.
         v = v_node.detach()
         v_t = v - (v * wall_n).sum(-1, keepdim=True) * wall_n
         speed = v_t.norm(dim=-1, keepdim=True)
         slip_gate = torch.sigmoid((speed - self.slip_v0) / self.slip_tau)
         w = c_w.detach() * (1.0 - slip_gate)
-        # Denominator is the TOTAL contact weight, not the gated weight -
-        # matching h_friction_magnitude. Normalizing by the gated weight would
-        # make this a weighted mean over static nodes only, in which case a
-        # uniform gate cancels top and bottom and the gating does nothing.
+
+        # only cares about static nodes; sliding nodes are handled elsewhere.
+        # normalized by the total contact weight to avoid scale issues.
         return ((w * (excess.clamp_min(0.0) / self.phi_g).pow(2)).sum()
                 / (c_w.detach().sum() + self.eps))
 
-    # ------------------------------------------------------------------
-    # h_pen  (proposal Eq. 5, second term) - architectural, no code needed.
-    # softplus in force_gns.assemble_contact_forces makes phi_n >= 0 always,
-    # so min(0, phi_n)^2 == 0 by construction.
-    # ------------------------------------------------------------------
 
+    # ==================================================================
+    # FLUID ANCHOR
     # ------------------------------------------------------------------
-    # h_smooth part (a): anchor the fluid force to the analytic drag law
-    # ------------------------------------------------------------------
+    # This function penalizes deviations of the predicted fluid acceleration from the analytic drag target.
+    # helps guide the learned fluid acceleration toward physically plausible values.
+    # ==================================================================
     def h_fluid_anchor(self, a_fluid_total, drag_target):
-        """The fluid FORCE must be what aerodynamics permits: the TOTAL
-        predicted fluid acceleration (learned residual plus baseline, if
-        enabled) is pulled toward the analytic quadratic law k|u|u evaluated
-        at the MEASURED relative wind. This is shrinkage toward the physics,
-        not toward zero - with the drag baseline on it reduces to keeping the
-        residual small (PIROM: the physics carries, the network corrects).
-
-        a_fluid_total: (B, 3) m/step^2 (learned + baseline)
-        drag_target:   (B, 3) m/step^2, analytic law at measured u - DETACHED
-                       by the caller (it is a target, not a pathway).
-        """
+        # Equation: h_anchor = ||(a_fluid_total[b] - drag_target[b]) / phi_g||^2.
         return ((a_fluid_total - drag_target) / self.phi_g).pow(2).sum(-1).mean()
 
+    # ==================================================================
+    # FLUID TEMPORAL SMOOTHNESS
     # ------------------------------------------------------------------
-    # h_smooth part (b): the fluid force may only change slowly in time
-    # ------------------------------------------------------------------
+    # This function penalizes abrupt changes in the predicted fluid wrench over time.
+    # helps guide the learned fluid wrench toward physically plausible temporal behavior.
+    # ==================================================================
     def h_fluid_temporal_smooth(self, fluid_series, torque_series=None):
-        """Fluid loads vary smoothly in time; contact impulses are the jumpy
-        thing. Penalizing the step-to-step change of the fluid wrench pushes
-        any rapidly-switching, contact-synchronized compensation (what stolen
-        friction looks like at a contact event) out of the fluid channel.
+        # Penalizes abrupt changes in the predicted fluid wrench over an
+        # unroll. Fluid loads should vary smoothly, while contact impulses may
+        # change rapidly.
+        # Equation: h_smooth = mean_k mean_b
+        # ||(fluid_series[k+1][b] - fluid_series[k][b]) / phi_g||^2.
+        # If torque_series is provided, its matching normalized temporal
+        # difference is added using ang_scale_vec:
+        # ||(torque_series[k+1][b] - torque_series[k][b]) / ang_scale_vec||^2.
+        # This constrains temporal variation, not the absolute fluid magnitude,
+        # and returns zero when there is only one unroll step.
 
-        THIS IS THE TERM THAT TRANSFERS TO REAL DATA. Unlike the anchor, it
-        makes no claim about the MAGNITUDE of the fluid wrench - only that
-        aerodynamic loads cannot switch discontinuously. That holds for a
-        cube in MuJoCo, for a tumbling body in a wind tunnel, and for the
-        aerial manipulator, whether or not any analytic model is available.
-        Torque is included for exactly that reason: real fluid torque is
-        nonzero but still smooth, so smoothness constrains it without
-        pretending to know its value.
-
-        Needs consecutive predictions: multistep >= 2. Returns 0 at K=1 (the
-        trainer warns once).
-
-        fluid_series:  list of (B, 3) total fluid accelerations, one per unroll
-                       step, in graph (not detached - both ends get gradient).
-        torque_series: optional matching list of (B, 3) fluid angular
-                       accelerations. Normalized by the angular scale so the
-                       two contributions are commensurate under one weight.
-        """
+        # Return zero if there are not enough time steps to compute differences.
         if len(fluid_series) < 2:
             return fluid_series[0].new_zeros(())
+
+        # Compute the squared normalized differences between consecutive fluid wrench predictions.
         diffs = [((b - a) / self.phi_g).pow(2).sum(-1).mean()
                  for a, b in zip(fluid_series[:-1], fluid_series[1:])]
+
+        # Average the squared differences to get the temporal smoothness loss.
         total = torch.stack(diffs).mean()
+
+        # Store the initial total before adding torque smoothness, if any.
         if torque_series is not None and len(torque_series) >= 2:
             tdiffs = [((b - a) / self.ang_scale_vec).pow(2).sum(-1).mean()
                       for a, b in zip(torque_series[:-1], torque_series[1:])]
             total = total + torch.stack(tdiffs).mean()
         return total
 
-    # ------------------------------------------------------------------
-    # Orchestrator
-    # ------------------------------------------------------------------
+    # This will compute all per-step loss terms for a single time step.
+    # Will check to see if the user assigned non-zero weights to each term before computing it.
+    # Saves the raw (unweighted) loss terms in a dictionary and returns it.
     def compute_step_terms(self, phi_contact, c_w, v_node, wall_n,
                            a_fluid_total, drag_target, weights):
-        """All per-step terms as a dict of RAW (unweighted) scalars. Terms
-        whose weight is zero are skipped (no wasted compute). The fluid
-        temporal-smoothness term spans the whole unroll, so the trainer
-        computes it separately."""
+        
         raws = {}
         if weights.get("w_fric_dir", 0) > 0:
             raws["fric_dir"] = self.h_friction_direction(
@@ -554,9 +529,8 @@ class PhysicsLosses(nn.Module):
         return raws
 
     @staticmethod
+    # Computes the weighted total of the raw loss terms based on the provided weights.
     def weighted_total(raws, weights):
-        """sum_j gamma_j h_j  (proposal Eq. 6). raws holds RAW magnitudes;
-        weights maps 'w_<name>' -> gamma."""
         total = 0.0
         for name, val in raws.items():
             total = total + weights.get("w_" + name, 0.0) * val
