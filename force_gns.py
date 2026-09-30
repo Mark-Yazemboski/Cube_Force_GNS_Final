@@ -1,53 +1,10 @@
-"""
-force_gns.py
+"""Force-based GNS model with an exact rigid-body dynamics layer.
 
-The force-based version of the GNS model plus the rigid-body dynamics layer
-that turns forces into motion. Training supervision is unchanged (position
-error only) - the model is never shown a force label.
-
-WHAT THE MODEL OUTPUTS:
-  - CONTACT: per-node forces, gated by a geometric contact indicator. Only
-    nodes near the floor can exert contact force. Tangential + softplus normal
-    (normal can push, never pull -> non-penetration is architectural).
-  - FLUID: ONE body-level wrench (force + torque at the COM), read out from
-    the pooled node latents. NOT per-node.
-
-WHY THE FLUID FORCE IS A COM WRENCH, NOT PER-NODE (design decision with the
-advisors, replacing the proposal's per-node complementarity for this system):
-  1. At N=8 corner nodes, hard complementarity pins the fluid resultant to the
-     wrong height (top nodes only, when the cube sits on the floor), creating
-     a fictitious pitching torque ~F*s/2 that the contact branch must absorb
-     with compensating fictitious forces. The trajectory still fits; the force
-     DECOMPOSITION - the thing this architecture exists to recover - gets
-     structurally corrupted.
-  2. MuJoCo's fluid model is itself a body-level wrench with no occlusion, so
-     a COM head matches the data-generating process exactly, and the logged
-     wrench labels compare against it one-to-one.
-  3. From rigid-body motion, a per-node fluid field is only identifiable
-     through its net 6-DOF wrench anyway; the COM head predicts exactly the
-     identifiable quantity. Contact keeps the distributed representation
-     because contact distribution IS partially identifiable and structured.
-  On a dense mesh (aerial manipulator) with real occlusion, per-node fluid
-  returns and this head becomes its pooled limit.
-
-Built in as exact physics (not learned): gravity; the cube's mass and inertia
-(I = (1/6) m s^2 * Identity - ISOTROPIC, so the gyroscopic term w x Iw is
-exactly zero and alpha = tau/I is the full Euler equation); exact rigidity
-(state is COM + rotation, so the mesh cannot deform - shape matching is
-deleted, not approximated); optionally the analytic quadratic drag baseline at
-the COM with the calibrated k/m, so the fluid head only learns the residual
-(its final layer is zero-initialized: the model STARTS as contact + gravity +
-analytic drag).
-
-UNITS (matches the existing pipeline): positions in meters, one "step" is one
-recorded frame (DT seconds). Per-node contact outputs are SPECIFIC forces
-phi_i = f_i * dt^2 / m (m/step^2, same units as the old acceleration targets).
-The fluid head outputs a COM acceleration (m/step^2) and an angular
-acceleration (rad/step^2) directly. In these units:
-    a_com = sum_i phi_i + g dt^2 + a_drag + a_fluid
-    alpha = sum_i r_i x phi_i / (I/m) + alpha_fluid
-Mass and dt cancel out of the contact-torque term; only the radius of
-gyration (I/m = s^2/6) enters.
+The model predicts per-node contact-specific forces and a body-level fluid
+wrench (COM acceleration and angular acceleration). Gravity, cube rigidity,
+and the optional analytic quadratic-drag baseline are handled by the physics
+layer rather than learned. Positions use meters; one step is one recorded
+frame, and accelerations use per-step-squared units.
 """
 
 import torch
@@ -60,12 +17,8 @@ from generate_node_states import BLOCK_WIDTH
 I_OVER_M = (BLOCK_WIDTH ** 2) / 6.0
 
 
-# ======================================================================
-# Rotation utilities (batched, differentiable, small-angle safe)
-# ======================================================================
-
+# function takes a quaternion in wxyz format and converts it to a rotation matrix
 def quat_wxyz_to_R(q):
-    """Batched scalar-first quaternion -> rotation matrix.  q: (..., 4) -> (..., 3, 3)."""
     q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     w, x, y, z = q.unbind(-1)
     R = torch.stack([
@@ -75,9 +28,8 @@ def quat_wxyz_to_R(q):
     ], dim=-2)
     return R
 
-
+# hat operator: converts a rotation vector to a skew-symmetric matrix
 def _hat(w):
-    """Rotation vector -> skew-symmetric matrix.  w: (..., 3) -> (..., 3, 3)."""
     zeros = torch.zeros_like(w[..., 0])
     wx, wy, wz = w.unbind(-1)
     return torch.stack([
@@ -87,9 +39,8 @@ def _hat(w):
     ], dim=-2)
 
 
+# Exponential map for SO(3): rotation vector -> rotation matrix
 def so3_exp(w):
-    """Rodrigues' formula, safe near theta -> 0 (Taylor series for the sinc terms).
-    w: (..., 3) rotation vector -> (..., 3, 3) rotation matrix."""
     theta = w.norm(dim=-1, keepdim=True).unsqueeze(-1)          # (..., 1, 1)
     K = _hat(w)
     small = theta < 1e-4
@@ -99,12 +50,8 @@ def so3_exp(w):
     eye = torch.eye(3, device=w.device, dtype=w.dtype).expand(K.shape)
     return eye + A * K + B * (K @ K)
 
-
+# Logarithm map for SO(3): rotation matrix -> rotation vector
 def so3_log(R):
-    """Rotation matrix -> rotation vector, safe near theta -> 0. Per-step
-    rotations in this project are tiny (~0.04 rad), so the theta -> pi branch
-    never occurs mid-rollout; still clamped for safety.
-    R: (..., 3, 3) -> (..., 3)."""
     tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
     cos_theta = ((tr - 1.0) * 0.5).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
     theta = torch.acos(cos_theta).unsqueeze(-1)                  # (..., 1)
@@ -119,28 +66,32 @@ def so3_log(R):
     return factor * vee
 
 
-# ======================================================================
-# GNS encoder / processor - same GNSLayer math as the acceleration model,
-# written with plain tensors (no torch_geometric).
-# ======================================================================
-
+#This is the main GNS layer used in the ForceGNSModel.
+#Outputs updated node features and edge features after one round of message passing.
 class GNSLayer(nn.Module):
 
     def __init__(self, node_dim, edge_dim, hidden_dim):
         super().__init__()
+
+        #Defines the edge MLP as a linear layer followed by a ReLU and another linear layer.
         self.edge_mlp = nn.Sequential(
             nn.Linear(node_dim * 2 + edge_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
+
+        #Defines the node MLP as a linear layer followed by a ReLU and another linear layer.
         self.node_mlp = nn.Sequential(
             nn.Linear(hidden_dim + node_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, node_dim)
         )
+
+        #Layer normalization for edge and node features to stabilize training.
         self.edge_norm = nn.LayerNorm(hidden_dim)
         self.node_norm = nn.LayerNorm(node_dim)
 
+    #Forward pass for the GNS layer: updates node and edge features based on the current graph structure.
     def forward(self, x, edge_index, edge_attr):
         senders, receivers = edge_index[0], edge_index[1]
         edge_input = torch.cat([x[senders], x[receivers], edge_attr], dim=-1)
@@ -150,7 +101,9 @@ class GNSLayer(nn.Module):
         x = x + self.node_norm(self.node_mlp(torch.cat([x, node_agg], dim=-1)))
         return x, edge_attr
 
-
+#This is the main ForceGNS model that uses the GNSLayer for 
+# message passing and has separate heads for contact and fluid predictions.
+# outputs contact_raw (B, N, 4) and fluid_raw (B, 6)
 class ForceGNSModel(nn.Module):
     """
     Encoder and processor are identical to the existing GNSModel. Two heads:
@@ -178,6 +131,8 @@ class ForceGNSModel(nn.Module):
                  normal_bias_init=-2.0):
         super().__init__()
         self.K = K
+
+        #Defines the encoder as a series of linear layers with ReLU activations and layer normalization for both nodes and edges.
         self.node_encoder = nn.Sequential(
             nn.Linear(node_in_dim, latent_dim),
             nn.ReLU(),
@@ -190,19 +145,25 @@ class ForceGNSModel(nn.Module):
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim)
         )
+        #Defines the processor as a list of GNS layers, each performing message passing and feature updates.
         self.processor_layers = nn.ModuleList([
             GNSLayer(latent_dim, latent_dim, latent_dim) for _ in range(L)
         ])
+        #Defines the contact decoder as a series of linear layers with ReLU activations, outputting per-node contact predictions.
         self.decoder_contact = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.ReLU(),
             nn.Linear(latent_dim, self.N_CONTACT_OUT)
         )
+        #Defines the fluid head as a series of linear layers with ReLU activations, outputting per-graph fluid predictions.
         self.fluid_head = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.ReLU(),
             nn.Linear(latent_dim, self.N_FLUID_OUT)
         )
+
+        #Initializes the biases for the contact decoder and the weights and biases for the fluid head 
+        #to ensure reasonable starting predictions.
         with torch.no_grad():
             # Normal-force channel starts small: softplus(-2) ~ 0.127, so four
             # resting contact nodes supply roughly the cube's weight at init
@@ -212,16 +173,26 @@ class ForceGNSModel(nn.Module):
             self.fluid_head[-1].weight.zero_()
             self.fluid_head[-1].bias.zero_()
 
+    #Forward pass for the ForceGNS model: encodes nodes and edges, applies message passing, 
+    #and decodes contact and fluid predictions.
     def forward(self, x, edge_index, edge_attr, num_graphs):
+
+        #Encode the node and edge features using the respective encoders.
         x = self.node_encoder(x)
         edge_attr = self.edge_encoder(edge_attr)
+
+        #Apply message passing through the processor layers K times.
         for _ in range(self.K):
             for layer in self.processor_layers:
                 x, edge_attr = layer(x, edge_index, edge_attr)
+
+        #Reshape the node features to per-graph format and decode contact and fluid predictions.
         N = x.shape[0] // num_graphs
         x_g = x.reshape(num_graphs, N, -1)
         contact_raw = self.decoder_contact(x_g)                  # (B, N, 4)
         fluid_raw = self.fluid_head(x_g.mean(dim=1))             # (B, 6)
+
+        #Return the raw contact and fluid predictions.
         return contact_raw, fluid_raw
 
 
@@ -229,17 +200,11 @@ class ForceGNSModel(nn.Module):
 # Output assembly
 # ======================================================================
 
+# calculate contact weight based on distance, threshold, and softness parameter
 def contact_weight(dist, d0, tau):
-    """Soft geometric contact indicator (1 = contact, 0 = free). Not learned:
-    contact detection for a cube on a flat floor is trivial geometry, and
-    fixing it removes a failure mode while the force representation is
-    validated. dist: (..., 1) signed node distance from the wall along its
-    normal. d0 is generous on purpose - MuJoCo's solref compliance means
-    contact forces act slightly before geometric touchdown. Soft (not hard) so
-    forces cannot pop discontinuously as a node crosses the boundary."""
     return torch.sigmoid((d0 - dist) / tau)
 
-
+# Assemble the contact forces from the raw contact predictions, contact weights, wall normal, and scaling vector.
 def assemble_contact_forces(contact_raw, c_w, wall_normal, scale_vec):
     """
     contact_raw: (B, N, 4) contact-head output
@@ -255,32 +220,24 @@ def assemble_contact_forces(contact_raw, c_w, wall_normal, scale_vec):
     t_raw = contact_raw[..., 0:3]
     n_raw = contact_raw[..., 3:4]
 
-    # Scale BEFORE projecting. scale_vec is an elementwise world-frame scale,
-    # and elementwise scaling does not commute with projection unless the wall
-    # normal lies along a coordinate axis: with s = [s_xy, s_xy, s_z] and a
-    # tilted n_hat, sum_k t_k n_k = 0 does NOT imply sum_k s_k t_k n_k = 0, so
-    # the tangential head could inject a normal component and defeat the
-    # softplus. Scaling first makes the projection exact for ANY wall normal.
-    # Bit-identical to the previous order for axis-aligned walls (floor
-    # (0,0,1), vertical inspection wall (1,0,0)); differs only on a ramp.
+    # Scale the tangential component before projecting it to ensure correct tangential force.
     t_scaled = t_raw * scale_vec
     t_vec = t_scaled - (t_scaled * n_hat).sum(-1, keepdim=True) * n_hat
 
-    # Output scale along the wall normal. Reduces to scale_vec[2] for a floor.
+    # Output scale along the wall normal.
     s_n = (scale_vec * n_hat).norm()
     n_mag = torch.nn.functional.softplus(n_raw) * s_n
 
+    # Combine the tangential and normal components to get the total contact force.
     return c_w * (t_vec + n_mag * n_hat)
 
 
+# Convert raw fluid predictions into linear and angular accelerations.
 def fluid_wrench_from_raw(fluid_raw, scale_vec, ang_scale_vec):
-    """fluid_raw (B, 6) -> (a_fluid (B, 3) in m/step^2,
-                            alpha_fluid (B, 3) in rad/step^2).
-    ang_scale_vec is the empirical angular-acceleration std [a_xy, a_xy, a_z],
-    the rotational analog of the existing acceleration normalization."""
     return fluid_raw[:, 0:3] * scale_vec, fluid_raw[:, 3:6] * ang_scale_vec
 
-
+# Analytic quadratic drag acceleration as a per-step^2 COM acceleration.
+# Used when baseline drag is turned on
 def drag_accel_step(wind, v_com_step, dt, k_over_m):
     """Analytic quadratic body-drag baseline as a per-step^2 COM acceleration.
     Uses the k/m coefficient CALIBRATED FROM DATA (wind_error_analysis.py).
@@ -294,12 +251,13 @@ def drag_accel_step(wind, v_com_step, dt, k_over_m):
 # Rigid-body dynamics layer (Verlet on COM, Lie-group Verlet on rotation)
 # ======================================================================
 
+# Convert rigid-body state (COM position and rotation) into world-frame node positions.
 def nodes_from_state(com, R, rest_nodes):
-    """World node positions from rigid state.
-    com: (B, 3)   R: (B, 3, 3)   rest_nodes: (N, 3)  ->  (B, N, 3)"""
     return com.unsqueeze(1) + torch.einsum('bij,nj->bni', R, rest_nodes)
 
 
+# Advance the cube's center-of-mass position and orientation by one time step.
+# Uses contact, gravity, and any optional fluid accelerations to update the state.
 def rigid_step(phi_contact, com_prev, com_curr, R_prev, R_curr, rest_nodes,
                g_step, extra_accel=None, extra_alpha=None):
     """
@@ -318,17 +276,19 @@ def rigid_step(phi_contact, com_prev, com_curr, R_prev, R_curr, rest_nodes,
 
     Returns (com_next, R_next).
     """
+        # Sum the translational accelerations and apply Verlet integration to the COM.
     a_com = phi_contact.sum(dim=1) + g_step
     if extra_accel is not None:
         a_com = a_com + extra_accel
     com_next = 2.0 * com_curr - com_prev + a_com
 
-    # Contact torque from lever arms; fluid torque arrives via extra_alpha.
+        # Compute contact torque from each node's lever arm and contact force.
     r = torch.einsum('bij,nj->bni', R_curr, rest_nodes)          # (B, N, 3)
     alpha = torch.cross(r, phi_contact, dim=-1).sum(dim=1) / I_OVER_M
     if extra_alpha is not None:
         alpha = alpha + extra_alpha
 
+        # Update angular velocity from the previous rotation, then integrate rotation.
     w_prev = so3_log(R_curr @ R_prev.transpose(-1, -2))          # (B, 3) rad/step
     R_next = so3_exp(w_prev + alpha) @ R_curr
     return com_next, R_next

@@ -34,19 +34,21 @@ import wall
 from train_force_gns import build_force_dataset, rollout_force_batched, load_trained_model
 
 
+#This function will do all of the evaluation work for the fully trained model.
+# It rolls out the test trajectories, computes metrics, and validates the force 
+# decomposition if wrench labels are available.
 def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, unscale):
-    """Roll out the test set, print metrics, and (if wrench labels are present)
-    validate the force decomposition. Returns the metrics dict. Figures and the
-    per-trajectory CSV are written to <model_folder>/force_eval_*.
-    """
+
+    # Output prefix for evaluation results (figures, CSVs, etc.)
     out_prefix = os.path.join(model_folder, "force_eval")
-    # ======================================================================
-    # Load model + config (force_cfg in the norms file is the single source of
-    # truth for dt / gravity / gates / drag flag - no chance of eval mismatch)
-    # ======================================================================
+
+    # Determine the device to run the evaluation on (GPU if available, else CPU).
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Create the floor object for the simulation environment.
     Floor = wall.wall(center_position=(0, 0, 0), size=(2, 2), normal=(0, 0, 1))
 
+    # Load the trained model along with its configuration, norms, and other necessary components.
     model, norms, cfg, rest_nodes, edge_index, _, k_over_m = load_trained_model(
         model_folder, device)
     print("Loaded force_cfg:", {k: v for k, v in cfg.items() if k != "scale_vec"})
@@ -55,14 +57,20 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
     # ======================================================================
     # Rollout the test set
     # ======================================================================
+
+    # Build the test dataset using the specified indices and data folder.
     trajs, _ = build_force_dataset(test_indices, data_folder,
                                    weights_only=weights_only, unscale_data=unscale)
+
+    # Attach the edge index to each trajectory for the model's use.
     for d in trajs:
         d["edge_index"] = edge_index
 
+    # Extract relevant configuration parameters for the rollout.
     h, dt, mass, g = cfg["h"], cfg["dt"], cfg["mass"], cfg["gravity"]
     g_step = torch.tensor([0.0, 0.0, -g]) * dt * dt
 
+    # Perform the batched rollout of the test trajectories using the trained model.
     center, angle, forces, (per_traj, _, _, lengths) = rollout_force_batched(
         model, trajs, Floor, h, rest_nodes,
         norms["x_mean"], norms["x_std"], norms["e_mean"], norms["e_std"],
@@ -76,7 +84,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
     print(f"ROLLOUT METRICS ({len(per_traj)} test trajectories)")
     print("=" * 70)
 
-
+    # Define helper functions to compute the mean and standard deviation of per-trajectory metrics.
     def _mean(key):
         vals = [float(m[key]) for m in per_traj if np.isfinite(float(m[key]))]
         return float(np.mean(vals)) if vals else float("nan")
@@ -95,21 +103,34 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
           f"{_mean('angle_error_airborne'):.2f} / {_mean('angle_error_contact'):.2f} / "
           f"{_mean('angle_error_settled'):.2f}")
 
+
     # ======================================================================
     # Wrench validation against the logged ground truth (if present)
     # ======================================================================
+
+    # Compute the gravitational force vector for the simulation.
     mg = mass * g
+
+
     rows = []
     imp_rows = []          # impulse-vs-force split, one dict per trajectory
+
+    # Initialize lists to store per-trajectory and impulse-vs-force split results.
     pooled = {"Fc_pred": [], "Fc_true": [], "Ff_pred": [], "Ff_true": [],
               "Tc_pred": [], "Tc_true": [], "Tf_pred": [], "Tf_true": [],
               "phase": []}
     drag_num = drag_den = 0.0
 
+    # Loop over each test trajectory to evaluate the model's predictions against the ground truth.
     for b, idx in enumerate(test_indices):
+        # Load the raw trajectory data for the current test index.
         raw = torch.load(os.path.join(data_folder, f"{idx}.pt"), weights_only=False)
+
+        # Initialize a dictionary to store the evaluation results for the current trajectory.
         row = dict(idx=idx, center=float(per_traj[b]["center_error"]),
                    angle=float(per_traj[b]["angle_error_deg"]))
+
+        # Check if the raw trajectory contains the necessary contact information.
         if len(raw) > 4 and isinstance(raw[4], dict) and "J_contact" in raw[4]:
             wr = raw[4]
             DT_lbl = float(wr["dt_record"])
@@ -118,6 +139,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             if n_pred <= 0:
                 rows.append(row); continue
 
+            # Extract the predicted and true forces and torques for the current trajectory.
             Fc_p = forces["F_contact"][b, :n_pred].numpy()
             Ff_p = forces["F_fluid"][b, :n_pred].numpy()
             Tc_p = forces["tau_contact"][b, :n_pred].numpy()
@@ -126,6 +148,8 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             Ff_t = (wr["J_fluid"].numpy() / DT_lbl)[2 * h: 2 * h + n_pred]
             Tc_t = (wr["tau_contact"].numpy() / DT_lbl)[2 * h: 2 * h + n_pred]
             Tf_t = (wr["tau_fluid"].numpy() / DT_lbl)[2 * h: 2 * h + n_pred]
+
+
 
             # ---- IMPULSE vs FORCE split -------------------------------
             # force_contact_err compares frame by frame. An impact lasts one
@@ -140,30 +164,48 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             # non-negligible, so a trajectory that bounces twice contributes
             # two episodes rather than one pooled block in which an early
             # error could cancel a late one.
+
+            # Compute the impulse (J = F * dt) for the predicted and true contact forces.
             Jc_p = Fc_p * DT_lbl
             Jc_t = Fc_t * DT_lbl
+
+            # Determine which frames have active contact based on the true contact force magnitude.
             active = np.linalg.norm(Fc_t, axis=1) > 0.05 * mg
+
+            # Compute the impulse split for the current trajectory based on active contact frames.
             imp_rows.append(compute_impulse_split(Jc_p, Jc_t, active))
 
+
+            # Extract the contact and settling times for the current trajectory.
             tc = int(per_traj[b]["t_contact"])            # from-h indexing
             ts = int(per_traj[b]["t_settle"])
-            # force prediction k sits at from-h index (h + k)
+
+            
+            # Compute the phase of each prediction frame: 0 = pre-contact, 1 = contact, 2 = post-settling.
             k_idx = np.arange(n_pred) + h
+
+            # Create an array of indices corresponding to each prediction frame.
             phase = np.where(k_idx < tc, 0, np.where(k_idx < ts, 1, 2))
 
+
+            # Store the predicted and true forces, torques, and phase information for later aggregation.
             pooled["Fc_pred"].append(Fc_p); pooled["Fc_true"].append(Fc_t)
             pooled["Ff_pred"].append(Ff_p); pooled["Ff_true"].append(Ff_t)
             pooled["Tc_pred"].append(Tc_p); pooled["Tc_true"].append(Tc_t)
             pooled["Tf_pred"].append(Tf_p); pooled["Tf_true"].append(Tf_t)
             pooled["phase"].append(phase)
 
+            # Compute the mean absolute error for the contact and fluid forces, normalized by mg.
             row.update(
                 Fc_mae_over_mg=float(np.linalg.norm(Fc_p - Fc_t, axis=1).mean() / mg),
                 Ff_mae_over_mg=float(np.linalg.norm(Ff_p - Ff_t, axis=1).mean() / mg),
             )
 
-            # drag-coefficient recovery from PREDICTED fluid force, airborne only
+            # Extract the wind vector for the current trajectory.
             wind = trajs[b]["wind"].numpy()
+
+            # If the wind vector is non-negligible, compute the drag coefficient 
+            # based on the predicted fluid force. This is used to compare against the true drag experienced by the object.
             if np.linalg.norm(wind) > 1e-6:
                 com = trajs[b]["com"].numpy()
                 v = (com[1:] - com[:-1]) / DT_lbl                     # m/s at interval t
@@ -179,9 +221,16 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
         rows.append(row)
 
     wrench_metrics = {}
+
+    # Aggregate the per-trajectory rows into overall wrench metrics.
     if imp_rows:
+
+        # Update the overall wrench metrics with the aggregated results from the important rows.
         wrench_metrics.update(aggregate(imp_rows))
+
+        # Retrieve the timing fraction for impulse events, if available.
         tf = wrench_metrics.get("impulse_timing_fraction")
+        
         if tf is not None:
             print("\n" + "=" * 70)
             print("CONTACT ERROR: TIMING vs MAGNITUDE")
@@ -194,8 +243,12 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
                   "   (1 = pure smearing, 0 = genuine force error)")
             print("=" * 70)
 
+    # Check if there are any labeled force predictions available.
     have_labels = len(pooled["Fc_pred"]) > 0
     if have_labels:
+
+        # Concatenate the predicted and true contact and fluid forces, 
+        # as well as the phase information, across all trajectories.
         Fc_p = np.concatenate(pooled["Fc_pred"]); Fc_t = np.concatenate(pooled["Fc_true"])
         Ff_p = np.concatenate(pooled["Ff_pred"]); Ff_t = np.concatenate(pooled["Ff_true"])
         ph = np.concatenate(pooled["phase"])
@@ -210,6 +263,9 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
         # (17% off) than when the true force is 0.001 mg (invented from nothing).
         print(f"{'phase':>10} {'n':>7} {'|dF_con|/mg':>12} {'true|F_con|':>12}"
               f" {'|dF_fld|/mg':>12} {'true|F_fld|':>12}")
+
+        # Loop over each phase (airborne, contact, settled) and compute the mean errors
+        # and true magnitudes for both contact and fluid forces.
         for p in (0, 1, 2):
             sel = ph == p
             if sel.sum() == 0:
@@ -225,12 +281,9 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             wrench_metrics[f"force_fluid_err_{names[p]}"] = float(ef)
             wrench_metrics[f"force_fluid_true_{names[p]}"] = float(tf_)
 
+        # Define a helper function to compute fit statistics (R^2, RMS of truth, 
+        # RMS of error, and error/signal ratio).
         def _fit_stats(a, b):
-            """R^2 plus the ratio that actually reads well when the true signal
-            is small. R^2 = 1 - SSE/SS_var, so a huge negative number just means
-            SSE >> SS_var - unreadable. sqrt(SSE/SS_var) says the same thing as
-            'the prediction error is N times the true signal's own RMS', which
-            is interpretable at any signal scale."""
             var = float(((b - b.mean(0)) ** 2).sum())
             sse = float(((a - b) ** 2).sum())
             n = b.size
@@ -241,15 +294,21 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             return 1.0 - sse / var, rms_true, rms_err, float(np.sqrt(sse / var))
 
         print()
+
+        # Compute and print fit statistics for both contact and fluid forces.
         for nm, P, Tt in (("contact", Fc_p, Fc_t), ("fluid  ", Ff_p, Ff_t)):
+            # Compute the fit statistics for the current force type (contact or fluid).
             r2, rms_true, rms_err, ratio = _fit_stats(P, Tt)
             print(f"{nm} force:  RMS(true) = {rms_true/mg:.5f} mg   "
                   f"RMS(error) = {rms_err/mg:.5f} mg   "
                   f"error/signal = {ratio:.1f}x"
                   + (f"   R^2 = {r2:.3f}" if r2 is not None and r2 > -1 else ""))
+            # If the R^2 value is very negative, print a warning that the prediction is poor.
             if r2 is not None and r2 <= -1:
                 print(f"{'':>13}-> prediction is {ratio:.0f}x the true signal's own RMS; "
                       f"R^2 ({r2:.0f}) is not informative at this scale")
+
+            # Store the computed fit statistics in the wrench_metrics dictionary for later use.
             tag = nm.strip()
             wrench_metrics[f"force_{tag}_rms_true"] = float(rms_true / mg)
             wrench_metrics[f"force_{tag}_rms_err"] = float(rms_err / mg)
@@ -257,6 +316,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
             if r2 is not None:
                 wrench_metrics[f"force_{tag}_r2"] = float(r2)
 
+        # If drag recovery information is available, compute and print the implied k/m from the predicted fluid force.
         if drag_den > 0:
             k_rec = drag_num / drag_den
             print(f"\nDrag recovery: implied k/m from PREDICTED fluid force = {k_rec:.5f} 1/m"
@@ -264,6 +324,11 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
                   f"model's k/m: {k_over_m:.5f})")
 
         # ---------------- figure ----------------
+
+        #This plot visualizes the contact and fluid forces for the first labeled trajectory, 
+        #as well as scatter plots comparing predicted vs true forces for all components.
+        #Used for visual inspection and validation of the force decomposition model.
+
         fig, axes = plt.subplots(2, 2, figsize=(12, 9))
         b0 = 0                                  # first labeled trajectory as the example
         n0 = lengths[b0] - 1 - 2 * h
@@ -306,8 +371,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
         w.writeheader(); w.writerows(rows)
     print(f"Saved per-trajectory CSV to {out_prefix}_per_traj.csv")
 
-    # phase_center / phase_angle are split into one CSV column per phase by
-    # run_report.save_run_report.
+    # Compile overall evaluation metrics into a dictionary for return.
     out = dict(
         center_error=float(center),
         angle_error_deg=float(angle),

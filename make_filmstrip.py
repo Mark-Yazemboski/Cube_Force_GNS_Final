@@ -1,32 +1,8 @@
-"""
-make_filmstrip.py
+"""Command-line wrapper for exporting force-model rollout filmstrips.
 
-Thin command-line wrapper around visualize_force_rollout() so you can export
-filmstrip frames without editing constants at the bottom of a file.
-
-Pick a trajectory with pick_trajectory.py first, then:
-
-    # wind figure: model and data must BOTH be the 20-wind set
-    python make_filmstrip.py \
-        --model models/FIN_W20_LEARNK_1 \
-        --data  data/mojoco_paper_replica_20_wind \
-        --traj  543 --panels 6 --no-gif
-
-    # force-decomposition figure on the 0-wind set
-    python make_filmstrip.py \
-        --model models/FIN_W0_1 \
-        --data  data/mojoco_paper_replica_0_wind \
-        --traj  529 --panels 6 --tangent-gain 12 --no-gif
-
-    # choose the frames yourself instead of letting it pick
-    python make_filmstrip.py --model ... --data ... --traj 543 \
-        --frames 14,19,23,31,48,90
-
-THE MODEL AND THE DATA MUST MATCH. A model trained on 20-wind rolled out on
-0-wind data is a different experiment, and the forces it draws are not the ones
-in your results table.
-
-Frames land in  <model>/frames_traj<N>/frame_XXX.pdf  unless you pass --outdir.
+Uses ``visualize_force_rollout`` to save selected frames and optional GIFs.
+The model and data directories must represent the same wind condition.
+Creates an entire filmstrip of key frames from the force-model rollout.
 """
 
 import argparse
@@ -35,7 +11,7 @@ import sys
 
 from visualize_force_model import visualize_force_rollout
 
-
+# Parses command-line arguments and invokes the visualization function.
 def parse_frames(text):
     if text is None:
         return "auto"
@@ -43,8 +19,12 @@ def parse_frames(text):
 
 
 def main():
+
+    # Parse command-line arguments.
     p = argparse.ArgumentParser(
         description="Export filmstrip frames from one rollout.")
+
+    # Define the command-line arguments.
     p.add_argument("--model", required=True,
                    help="folder holding *_norms.pt and the checkpoint")
     p.add_argument("--data", required=True, help="trajectory folder")
@@ -88,14 +68,18 @@ def main():
     p.add_argument("--unscale", action="store_true")
     p.add_argument("--no-ground-truth", action="store_true",
                    help="hide the blue ground-truth cube")
+
     a = p.parse_args()
 
+    # Verify that the specified model and data directories exist.
     for path, what in ((a.model, "model folder"), (a.data, "data folder")):
         if not os.path.isdir(path):
             sys.exit(f"{what} does not exist: {path}")
 
+    # Construct the path for the output GIF based on the model directory and trajectory.
     gif_path = os.path.join(a.model, f"force_rollout_{a.traj}.gif")
 
+    # Invoke the visualization function to generate the filmstrip and optionally the GIF.
     out = visualize_force_rollout(
         a.model, a.data, a.traj,
         model_prefix=a.prefix,

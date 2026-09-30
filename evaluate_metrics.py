@@ -15,7 +15,8 @@ CONTACT_Z_THRESH    = 0.2 * BLOCK_HALF_WIDTH   # lowest node within ~1cm of floo
 SETTLE_SPEED_THRESH = 0.01 * BLOCK_WIDTH       # per-step COM displacement below this => "stopped"
 SETTLE_RUN          = 5                          # consecutive sub-threshold frames => settled
 
-
+#Finds the different phase boundaries (airborne, contact, settled)
+# for a given trajectory based on the true positions.
 def compute_phase_boundaries(true_positions,
                              contact_z_thresh=CONTACT_Z_THRESH,
                              settle_speed_thresh=SETTLE_SPEED_THRESH,

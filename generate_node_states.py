@@ -67,7 +67,7 @@ def knn_adjacency(nodes, k):
     edge_index = np.array(edge_list).T  # shape (2, num_edges)
     return edge_index
 
-
+#Adds random walk noise to a sequence of positions, returning the new positions and the noise applied
 def add_random_walk_noise(positions, noise_scale):
     velocities = positions[1:] - positions[:-1]            # (T, N, 3)
     T, N, _ = velocities.shape
