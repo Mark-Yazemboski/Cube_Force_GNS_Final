@@ -1,32 +1,22 @@
-"""Force-based GNS model with an exact rigid-body dynamics layer.
-
-The model predicts per-node contact-specific forces and a body-level fluid
-wrench (COM acceleration and angular acceleration). Gravity, cube rigidity,
-and the optional analytic quadratic-drag baseline are handled by the physics
-layer rather than learned. Positions use meters; one step is one recorded
-frame, and accelerations use per-step-squared units.
+"""Define the graph neural network and rigid-body dynamics used to predict cube
+motion. The network encodes node and edge features, passes messages between
+surface nodes, and produces per-node contact outputs plus a body-level fluid
+output. Supporting functions convert these outputs into contact forces and
+fluid accelerations, apply a smooth contact gate and optional analytic drag,
+and advance the cube's center of mass and orientation while preserving its
+rigid shape. Training and rollout share these model and dynamics components;
+positions use meters and accelerations use meters per recorded step squared.
 """
 
 import torch
 import torch.nn as nn
 
-from generate_node_states import BLOCK_WIDTH
+from force_data import BLOCK_WIDTH
 
 # Solid cube inertia over mass: I/m = s^2 / 6, identical about every axis.
 # Isotropic inertia => w x (I w) = I_scalar * (w x w) = 0 exactly.
 I_OVER_M = (BLOCK_WIDTH ** 2) / 6.0
 
-
-# function takes a quaternion in wxyz format and converts it to a rotation matrix
-def quat_wxyz_to_R(q):
-    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    w, x, y, z = q.unbind(-1)
-    R = torch.stack([
-        torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],     dim=-1),
-        torch.stack([2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],     dim=-1),
-        torch.stack([2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)], dim=-1),
-    ], dim=-2)
-    return R
 
 # hat operator: converts a rotation vector to a skew-symmetric matrix
 def _hat(w):

@@ -1,3 +1,12 @@
+"""Represent the planar floor or wall used by the cube simulations and draw it
+in 3D visualizations. The wall class stores the plane's center, normal vector,
+and display size so feature construction and contact calculations can use
+the same surface definition. Its geometry helper computes the corners of a
+rectangular patch in that plane, and show() adds the patch to a Matplotlib
+3D axis. Training, evaluation, and visualization create wall objects to
+describe the surface the cube interacts with.
+"""
+
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 

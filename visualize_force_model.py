@@ -1,11 +1,14 @@
-"""
-visualize_force_model.py
+"""Visualize a saved force GNS model's predictions alongside the true motion of
+a cube. This module loads one trajectory, runs the shared rollout, and draws
+the predicted and ground-truth cubes in 3D with arrows for per-node normal
+and tangential contact forces and the net fluid force at the center of mass.
+It supports animation and still-frame exports, with automatic frame selection
+around contact and settling events for filmstrips. The experiment runner
+uses it to generate rollout animations, and make_filmstrip.py exposes its
+figure-export options through the command line.
 
-3D animation of a force-model rollout (red predicted cube, blue ground-truth
-cube, wireframe edges, optional GIF) that also draws the forces the model is
-predicting:
-
-  * TWO arrows per node in contact:
+Force display details:
+* TWO arrows per node in contact:
       - NORMAL    (green)  along the wall normal, >= 0 by construction
       - TANGENTIAL(orange) in the floor plane - this is the friction force
     Nodes the contact gate has switched off draw nothing, so you can watch
@@ -15,9 +18,6 @@ predicting:
 
 Rollout only - the cube follows the model's own predictions and the forces are
 whatever it predicts as it drifts.
-
-Called by run_force_multi_step.py (GIFs) and make_filmstrip.py (vector frames
-for figures).
 """
 
 import os
@@ -34,8 +34,9 @@ from matplotlib import animation
 from mpl_toolkits.mplot3d import Axes3D  
 
 import wall
-from generate_node_states import BLOCK_WIDTH
-from train_force_gns import build_force_dataset, rollout_force_batched, load_trained_model
+from force_data import BLOCK_WIDTH
+from force_data import build_force_dataset
+from force_rollout import rollout_force_batched, load_trained_model
 
 
 #This will automatically select key frames for the filmstrip based on events such as impacts and sliding.

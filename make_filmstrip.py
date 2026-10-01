@@ -1,8 +1,11 @@
-"""Command-line wrapper for exporting force-model rollout filmstrips.
-
-Uses ``visualize_force_rollout`` to save selected frames and optional GIFs.
-The model and data directories must represent the same wind condition.
-Creates an entire filmstrip of key frames from the force-model rollout.
+"""Provide a command-line entry point for exporting figures from a saved force
+GNS rollout. This script parses the model folder, matching trajectory data,
+trajectory number, frame selection, and display/export options, then calls
+visualize_force_rollout() in visualize_force_model.py to produce the output.
+Frames can be selected explicitly or chosen automatically around motion and
+contact events, and an animation can be exported alongside the filmstrip.
+This file owns the command-line interface, while the visualization module
+handles model rollout and drawing.
 """
 
 import argparse

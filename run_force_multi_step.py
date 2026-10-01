@@ -1,7 +1,11 @@
-"""
-run_force_multi_step.py
-
-Main file for running the force GNS architecture
+"""Configure and execute a complete force GNS experiment. This is the main script
+for choosing trajectory folders and dataset splits, model architecture,
+training duration, multistep settings, physical constants, and physics-loss
+weights. It uses those settings to call the trainer, evaluate saved models,
+collect training and checkpoint diagnostics, write individual and master run
+reports, and generate rollout visualizations. Flags control which stages run,
+making this the place to change experiment settings while the imported
+modules implement training, evaluation, reporting, and plotting.
 """
 
 import os
@@ -10,9 +14,8 @@ import wall
 from train_force_gns import train_force_gnn
 from evaluate_force_model import evaluate_force_model
 from visualize_force_model import visualize_force_rollout
-from run_report import save_run_report
-from run_diagnostics import collect_run_diagnostics
-from generate_node_states import BLOCK_HALF_WIDTH
+from run_report import save_run_report, collect_run_diagnostics
+from force_data import BLOCK_HALF_WIDTH
 from physics_losses import summarize_diagnostics, reset_diagnostics
 
 
@@ -114,7 +117,7 @@ keep_last_n_checkpoints = 2
 # ----------------------------------------------------------------------
 # CONSTANT SETTINGS
 # ----------------------------------------------------------------------
-DT = 1.0 / 148.0        # replica record rate. NOTE: generate_node_states.DT_RECORD
+DT = 1.0 / 148.0        # replica record rate. NOTE: force_data.DT_RECORD
                         # is 0.00674 (0.0001348*50) while the replica records at
                         # 1/148 = 0.006757 - the known small mismatch. The wind
                         # FEATURE (imported builder) keeps the old constant for

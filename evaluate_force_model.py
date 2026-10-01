@@ -1,19 +1,10 @@
-"""
-evaluate_force_model.py
-
-Evaluation for the force-based GNS. Two jobs:
-
-  1. ROLLOUT METRICS - same numbers as the acceleration pipeline (center error
-     per block width, angle error, per-phase split), so the Stage-1 parity
-     comparison is apples to apples.
-
-  2. WRENCH-DECOMPOSITION VALIDATION - the payoff of the force representation.
-     If the dataset folder was labeled by add_wrench_labels.py, the predicted
-     contact and fluid wrenches are compared per frame against MuJoCo's ground
-     truth. The model was trained on POSITIONS ONLY, so agreement here means it
-     recovered a force split it was never shown. Also fits the drag coefficient
-     implied by the predicted fluid force on airborne frames and compares it to
-     the calibrated k/m - the "recovered the physical law" check.
+"""Evaluate a saved force GNS model on a set of held-out cube trajectories. This
+module loads the model and data, runs predictions through force_rollout.py,
+and summarizes position, orientation, floor-penetration, and motion-phase
+errors. When ground-truth wrench labels are available, it also compares
+contact and fluid forces and torques, measures impulse errors, and estimates
+the drag coefficient implied by the predicted fluid force. It saves evaluation
+plots and CSV results and returns a metric dictionary for the run report.
 
 ALIGNMENT: the k-th force prediction of a rollout comes from the window ending
 at original frame t = 2h + k and drives interval t -> t+1, so it pairs with
@@ -24,14 +15,15 @@ import os
 import csv
 import numpy as np
 
-from impulse_diagnostic import compute_impulse_split, aggregate
+from evaluate_metrics import compute_impulse_split, aggregate_impulse_metrics
 import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import wall
-from train_force_gns import build_force_dataset, rollout_force_batched, load_trained_model
+from force_data import build_force_dataset
+from force_rollout import rollout_force_batched, load_trained_model
 
 
 #This function will do all of the evaluation work for the fully trained model.
@@ -226,7 +218,7 @@ def evaluate_force_model(model_folder, data_folder, test_indices, weights_only, 
     if imp_rows:
 
         # Update the overall wrench metrics with the aggregated results from the important rows.
-        wrench_metrics.update(aggregate(imp_rows))
+        wrench_metrics.update(aggregate_impulse_metrics(imp_rows))
 
         # Retrieve the timing fraction for impulse events, if available.
         tf = wrench_metrics.get("impulse_timing_fraction")

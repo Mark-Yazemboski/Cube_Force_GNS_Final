@@ -1,8 +1,11 @@
-"""
-physics_losses.py
-
-This file hold all of the different physics loss terms used in training the force GNN.
-It also holds the diagnostic history and provides utility functions for summarizing it.
+"""Define the optional physics penalties that guide the force GNS during training.
+The PhysicsLosses module manages fixed or learnable friction and drag
+coefficients and evaluates constraints on friction direction and magnitude,
+the Coulomb friction cone, analytic fluid drag, and temporal fluid smoothness.
+It scales these residuals so their magnitudes can be interpreted alongside
+the trajectory loss. The file also records a bounded history of slip/contact
+diagnostics and provides reset and summary functions so the experiment runner
+can report how the physical constraints behaved during training.
 
 ======================================================================
 NORMALIZATION
