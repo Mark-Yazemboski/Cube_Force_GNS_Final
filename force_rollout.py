@@ -30,7 +30,7 @@ from force_gns import (ForceGNSModel, rigid_step, nodes_from_state, contact_weig
 # It is called at each unroll/rollout step to prepare the batched features that
 # the force model consumes; _noisy_features_and_targets() is used only while
 # computing normalization statistics from trajectory data.
-def _build_features_for_unroll(pos_window, edge_index, nodes_body, Wall, wind,
+def _build_features_for_unroll(pos_window, edge_index, Wall, wind,
                                x_mean, x_std, e_mean, e_std, B, N, use_wind):
 
     # Get the device from the most recent position tensor.
@@ -63,16 +63,13 @@ def _build_features_for_unroll(pos_window, edge_index, nodes_body, Wall, wind,
     # Concatenate all parts to form the final node feature matrix.
     x_node = torch.cat(node_parts, dim=-1).reshape(B * N, -1)
 
-    # Compute edge features based on the current positions and body node positions.
+    # Each edge contains the current displacement vector and its magnitude.
     x_t_flat = x_t.reshape(B * N, 3)
-    nodes_body_flat = nodes_body.reshape(B * N, 3)
     src, dst = edge_index[0], edge_index[1]
 
     # Compute the relative position vectors and their norms for the edges.
     d  = x_t_flat[src]        - x_t_flat[dst]
-    dU = nodes_body_flat[src] - nodes_body_flat[dst]
-    e_attr = torch.cat([d, torch.norm(d, dim=-1, keepdim=True),
-                        dU, torch.norm(dU, dim=-1, keepdim=True)], dim=-1)
+    e_attr = torch.cat([d, torch.norm(d, dim=-1, keepdim=True)], dim=-1)
 
     # Normalize the node and edge features using the provided means and standard deviations.
     x_node = (x_node - x_mean) / x_std
@@ -117,9 +114,8 @@ def rollout_force_batched(model, trajs, Wall, h, rest_nodes,
     # gets the wind vectors for all trajectories and moves them to the device.
     wind = torch.stack([t["wind"] for t in trajs]).to(device)
 
-    # Move the rest nodes to the device and create a batch-expanded version.
+    # Move the rest nodes to the rollout device.
     rest_nodes = rest_nodes.to(device)
-    rest_b = rest_nodes.unsqueeze(0).expand(B, -1, -1)
 
     # Prepare the batched edge index for all trajectories.
     ei = trajs[0]["edge_index"].to(device)
@@ -171,7 +167,7 @@ def rollout_force_batched(model, trajs, Wall, h, rest_nodes,
 
             # Build the input features for the current unroll step.
             x_node, e_attr = _build_features_for_unroll(
-                pos_window, edge_index_b, rest_b, Wall, wind,
+                pos_window, edge_index_b, Wall, wind,
                 x_mean, x_std, e_mean, e_std, B, N, use_wind)
 
             # Forward pass through the model to obtain raw contact and fluid forces.
@@ -299,6 +295,10 @@ def load_trained_model(model_folder, device, prefix=None, checkpoint="best"):
 
     # Load the normalization statistics for the model.
     norms = torch.load(os.path.join(model_folder, prefix + "_norms.pt"), weights_only=False)
+    if norms["e_mean"].numel() != 4 or norms["e_std"].numel() != 4:
+        raise ValueError(
+            "This checkpoint uses the old edge features. Retrain with the four "
+            "displacement-and-magnitude features, or evaluate it using the old code.")
     # Extract the force configuration from the loaded normalization statistics.
     cfg = norms["force_cfg"]
 

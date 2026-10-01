@@ -11,7 +11,7 @@ modules implement training, evaluation, reporting, and plotting.
 import os
 import torch
 import wall
-from train_force_gns import train_force_gnn
+from train_force_gns import train_force_gnn, epochs_for_optimizer_steps
 from evaluate_force_model import evaluate_force_model
 from visualize_force_model import visualize_force_rollout
 from run_report import save_run_report, collect_run_diagnostics
@@ -79,17 +79,20 @@ batch_size = 512
 learning_rate = 1e-4
 noise_scale = 3e-4 * BLOCK_HALF_WIDTH            # meters/step, same as accel runs
 
-# Training length, in epochs, the SAME for every configuration.
-# At K=1 this is the budget that has been used all along (validation flattens
-# around 6k, so 10k is headroom). Holding it fixed across K also keeps the
-# number of OPTIMIZER STEPS roughly constant - samples per trajectory are
-# T - h - K, so K barely changes the steps per epoch - which makes a K
-# comparison a comparison of gradient updates, not of compute. The cost is
-# wall clock: a K-step unroll backprops through K predictions, so K=4 runs
-# about 4x longer per epoch.
+# Set an optimizer-step target (e.g. 1_000_000) to derive the epoch budget.
+# None uses epochs below. Conversion counts actual trajectory windows, partial
+# batches, gradient accumulation, and curriculum phases, then rounds UP to a
+# whole epoch. Early stopping can end the run before reaching this target.
+target_optimizer_steps = None
 epochs = 10000
 
 
+
+
+# Stop after this many epochs without a lower validation center error.
+# None disables early stopping. Patience begins at the final curriculum K;
+# validation also runs at the deadline before deciding whether to stop.
+early_stopping_patience = 2000
 
 # Multistep Settings --------------------------------------------------------------------------------------------
 multistep = 4                                    # K >= 2 required for w_fluid_smooth
@@ -99,7 +102,7 @@ curriculum_schedule = None                       # None -> powers of 2 up to mul
 #Sets the learning rate scheduler for the training process, 3 options "decay", "cosine", or None
 Learning_Rate_Scheduler = None                
 
-#Accumulation settings will modify how many contact frames are added to the batch during training.
+# Number of minibatches whose gradients are accumulated per optimizer update.
 accumulation_steps = 1
 
 # Validation and checkpoint intervals
@@ -208,16 +211,31 @@ VISUALIZE_SHOW = False
 
 # Flag to save a run report and specify the master CSV file for all runs.
 Save_run_report = True
-master_excel_file_name = "all_force_runs_master.csv"
+master_excel_file_name = "master_test_tracker.csv"
 FORCE_MASTER_CSV = os.path.join(script_dir, "models", master_excel_file_name)
 
 # ----------------------------------------------------------------------
 
 #If the training flag is set, train the model.
+planned_optimizer_steps = None
 if Train_model:
 
     # Clear the diagnostic buffers in case several trainings share a process.
     reset_diagnostics()
+
+    # Inspect actual trajectory lengths so the step budget matches the trainer.
+    if target_optimizer_steps is not None:
+        trajectory_lengths = [
+            int(torch.load(os.path.join(trajectory_folder, f"{idx}.pt"),
+                           weights_only=weights_only_load)[0].shape[0])
+            for idx in train_range
+        ]
+        epochs, planned_optimizer_steps = epochs_for_optimizer_steps(
+            trajectory_lengths, target_optimizer_steps, batch_size,
+            pos_history, multistep, accumulation_steps,
+            curriculum_epochs, curriculum_schedule)
+        print(f"Optimizer-step target: {target_optimizer_steps:,} -> {epochs:,} epochs "
+              f"({planned_optimizer_steps:,} planned updates before early stopping)")
 
     #Train the force GNN model with the specified parameters.
     train_force_gnn(
@@ -227,6 +245,7 @@ if Train_model:
         save_model_path=save_model_path,
         trajectory_folder=trajectory_folder,
         epochs=epochs,
+        early_stopping_patience=early_stopping_patience,
         batch_size=batch_size,
         accumulation_steps=accumulation_steps,
         lr=learning_rate,
@@ -313,6 +332,7 @@ if Evaluate_model:
     #   recovered_mu, recovered_k_over_m: final values from the physics file.
     #   final_train_loss, final_train_loss_std, final_train_loss_n: mean,
     #     standard deviation, and finite-value count over the last 20 losses.
+    #   epochs_completed, stopped_early: actual duration and stopping status.
     #   best_val_loss, best_val_epoch, total_optimizer_steps: values saved in
     #     the loss-history file, when present.
     #   mu_init / k_init, mu_drift / k_drift, and
@@ -348,6 +368,10 @@ if Evaluate_model:
             batch_size=batch_size,
             learning_rate=learning_rate,
             epochs=epochs,
+            target_optimizer_steps=target_optimizer_steps,
+            planned_optimizer_steps=planned_optimizer_steps,
+            accumulation_steps=accumulation_steps,
+            early_stopping_patience=early_stopping_patience,
             noise_scale=noise_scale,
             multistep=multistep,
             curriculum_epochs=curriculum_epochs,

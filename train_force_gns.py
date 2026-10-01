@@ -3,8 +3,9 @@ trajectories. This module computes normalization statistics, builds batches
 with state-history and future-target windows, applies noise and rotation
 augmentation, and differentiates through multiple predicted rigid-body steps
 to compute trajectory and optional physics losses. It manages optimization,
-the multistep curriculum, rollout-based validation, checkpoint selection,
-and saved loss and parameter histories. Experiment settings come from
+the multistep curriculum, rollout-based validation, early stopping, checkpoint
+selection, and saved loss and parameter histories. It also converts requested
+optimizer-step budgets into whole epochs. Experiment settings come from
 run_force_multi_step.py; data preparation, model dynamics, and shared rollout
 operations are supplied by force_data.py, force_gns.py, and force_rollout.py.
 """
@@ -33,22 +34,20 @@ from physics_losses import PhysicsLosses
 #This function takes one trajectory's node positions, applies random-walk noise to them,
 #and returns the node features, edge features, and target accelerations for every timestep.
 #It is only used to compute the normalization stats.
-def _noisy_features_and_targets(positions, wind_vector, nodes_body, edge_index, Wall, h,
+def _noisy_features_and_targets(positions, wind_vector, edge_index, Wall, h,
                                 noise_scale, use_wind):
     """
     positions: (T, N, 3) clean node positions of one trajectory.
-    Returns (x (M*N, node_dim), e (M*E, 8), y (M*N, 3)) stacked over the M
+    Returns (x (M*N, node_dim), e (M*E, 4), y (M*N, 3)) stacked over the M
     timestep samples
     """
 
     # Add random-walk noise to the clean positions to simulate realistic perturbations.
     noisy_positions, noise = add_random_walk_noise(positions, noise_scale=noise_scale)
 
-    #compute the relative displacement between sender and receiver nodes in the body frame
+    # Identify the sender and receiver nodes for each edge.
     sender = edge_index[0]
     receiver = edge_index[1]
-    dU = nodes_body[sender] - nodes_body[receiver]
-    dU_norm = torch.norm(dU, dim=1, keepdim=True)
 
     # Extract wall normal and center position as tensors.
     wall_n = torch.as_tensor(Wall.normal, dtype=torch.float32)
@@ -81,14 +80,11 @@ def _noisy_features_and_targets(positions, wind_vector, nodes_body, edge_index, 
     node_parts.append(dist_all)
     x_node_all = torch.cat(node_parts, dim=-1)
 
-    #Computes the edge features for each edge over the past h timesteps, including relative 
-    #positions and displacements.
+    # Each edge contains the current displacement vector and its magnitude.
     pos_at_t = noisy_positions[h : T-1]                                # (M, N, 3)
     d_all = pos_at_t[:, sender] - pos_at_t[:, receiver]                # (M, E, 3)
     d_norm_all = torch.norm(d_all, dim=-1, keepdim=True)               # (M, E, 1)
-    dU_broadcast = dU.unsqueeze(0).expand(M, -1, -1)
-    dU_norm_broadcast = dU_norm.unsqueeze(0).expand(M, -1, -1)
-    e_attr_all = torch.cat([d_all, d_norm_all, dU_broadcast, dU_norm_broadcast], dim=-1)  # (M, E, 8)
+    e_attr_all = torch.cat([d_all, d_norm_all], dim=-1)  # (M, E, 4)
 
     #Computes the acceleration targets for each node based on the finite-difference of the clean positions, corrected for noise.
     # These targets are used for training the model to predict node accelerations.
@@ -110,7 +106,7 @@ def _normalization_stats(dataset, rest_nodes, edge_index, Wall, h, noise_scale, 
     #Iterates over the dataset to collect all node features, edge features, and acceleration targets.
     for d in dataset:
         positions = d["com"].unsqueeze(1) + torch.einsum('tij,nj->tni', d["R"], rest_nodes)
-        sample = _noisy_features_and_targets(positions, d["wind"], rest_nodes, edge_index,
+        sample = _noisy_features_and_targets(positions, d["wind"], edge_index,
                                              Wall, h, noise_scale, use_wind)
         if sample is None:
             continue
@@ -326,8 +322,6 @@ def _unroll_force_loss(model, batch, multistep, Wall, h, rest_nodes,
     # Extract the previous and current COM and rotation matrices for the rigid step.
     com_prev, com_curr = com_win[:, -2], com_win[:, -1]
     R_prev, R_curr = R_win[:, -2], R_win[:, -1]
-    # Expand the rest nodes to match the batch size.
-    rest_b = rest_nodes.unsqueeze(0).expand(B, -1, -1)
 
     # Check if any physics loss terms are active and initialize accumulators for raw losses and series data.
     any_phys = any(v > 0 for v in phys_weights.values())
@@ -343,7 +337,7 @@ def _unroll_force_loss(model, batch, multistep, Wall, h, rest_nodes,
 
         # Build the input features for the current unroll step
         x_node, e_attr = _build_features_for_unroll(
-            pos_window, edge_index_b, rest_b, Wall, wind,
+            pos_window, edge_index_b, Wall, wind,
             x_mean, x_std, e_mean, e_std, B, N, use_wind)
 
         # Runs the model to obtain raw contact and fluid predictions.
@@ -462,6 +456,62 @@ def _unroll_force_loss(model, batch, multistep, Wall, h, rest_nodes,
     return total, {k: float(v.detach()) for k, v in raw_terms.items()}
 
 
+def _resolve_curriculum(multistep, curriculum_epochs, curriculum_schedule):
+    """Return the same validated rollout-length schedule for planning and training."""
+    if multistep < 1 or curriculum_epochs < 0:
+        raise ValueError("multistep must be positive and curriculum_epochs nonnegative")
+    if curriculum_epochs == 0 or multistep == 1:
+        return [multistep]
+    if curriculum_schedule is None:
+        schedule = []
+        k = 1
+        while k < multistep:
+            schedule.append(k)
+            k *= 2
+        return schedule + [multistep]
+    schedule = list(curriculum_schedule)
+    if (not schedule or schedule[-1] != multistep
+            or any(not isinstance(k, int) or not 1 <= k <= multistep for k in schedule)
+            or any(a > b for a, b in zip(schedule, schedule[1:]))):
+        raise ValueError("curriculum_schedule must be nondecreasing positive integers ending at multistep")
+    return schedule
+
+
+def epochs_for_optimizer_steps(trajectory_lengths, target_optimizer_steps, batch_size,
+                              h, multistep, accumulation_steps=1,
+                              curriculum_epochs=0, curriculum_schedule=None):
+    """Return (epochs, planned_steps), rounding the target up to a complete epoch.
+
+    Each length T supplies max(T - h - K, 0) training windows. Both the final
+    partial batch and final partial gradient-accumulation group count. Earlier
+    curriculum phases last curriculum_epochs; the final phase continues until
+    the target is reached. Early stopping can shorten the actual run.
+    """
+    for name, value in (("target_optimizer_steps", target_optimizer_steps),
+                        ("batch_size", batch_size), ("h", h),
+                        ("multistep", multistep), ("accumulation_steps", accumulation_steps)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(curriculum_epochs, int) or curriculum_epochs < 0:
+        raise ValueError("curriculum_epochs must be a nonnegative integer")
+    lengths = list(trajectory_lengths)
+    schedule = _resolve_curriculum(multistep, curriculum_epochs, curriculum_schedule)
+    epochs = steps = 0
+    for phase, k in enumerate(schedule):
+        windows = sum(max(int(length) - h - k, 0) for length in lengths)
+        batches = (windows + batch_size - 1) // batch_size
+        steps_per_epoch = (batches + accumulation_steps - 1) // accumulation_steps
+        if steps_per_epoch == 0:
+            raise ValueError(f"No training windows available for history={h}, rollout K={k}")
+        needed = (target_optimizer_steps - steps + steps_per_epoch - 1) // steps_per_epoch
+        phase_epochs = needed if phase == len(schedule) - 1 else min(needed, curriculum_epochs)
+        epochs += phase_epochs
+        steps += phase_epochs * steps_per_epoch
+        if steps >= target_optimizer_steps:
+            return epochs, steps
+    raise AssertionError("Final curriculum phase should exhaust the step target")
+
+
 #This function is the main training loop for the force GNN model.
 def train_force_gnn(Wall,
                     train_range,
@@ -509,7 +559,18 @@ def train_force_gnn(Wall,
                     epoch_checkpoint_interval,
                     keep_last_n_checkpoints,   # rotate; 0/None = keep all
                     slip_v0=1e-3, slip_tau=1e-4,   # slip gate (m/step)
-                    compile_model=True):
+                    compile_model=True,
+                    early_stopping_patience=None):
+
+    # Patience counts completed epochs, not the number of validation checks.
+    if epochs < 1 or batch_size < 1 or accumulation_steps < 1:
+        raise ValueError("epochs, batch_size, and accumulation_steps must be positive")
+    if validation_check_interval < 1 or epoch_checkpoint_interval < 1:
+        raise ValueError("validation and checkpoint intervals must be positive")
+    if early_stopping_patience is not None and (
+            not isinstance(early_stopping_patience, int) or early_stopping_patience < 1):
+        raise ValueError("early_stopping_patience must be a positive integer or None")
+    schedule = _resolve_curriculum(multistep, curriculum_epochs, curriculum_schedule)
 
     # Set the device for training (GPU if available, otherwise CPU).
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -626,6 +687,8 @@ def train_force_gnn(Wall,
                      nodes_per_edge=nodes_per_edge,
                      nearest_neighbors=nearest_neighbors,
                      multistep=multistep, epochs=epochs,
+                     early_stopping_patience=early_stopping_patience,
+                     edge_features="displacement_and_magnitude",
                      scale_vec=scale_vec, ang_scale_vec=ang_scale_vec,
                      loss_mode=loss_mode,
                      w_fric_dir=w_fric_dir, w_fric_mag=w_fric_mag,
@@ -679,26 +742,15 @@ def train_force_gnn(Wall,
     elif Learning_Rate_Scheduler == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    #This will set up the curriculum learning schedule if applicable.
-    #Curriculum basically means gradually increasing the multistep parameter over the course of training.
-    if curriculum_epochs > 0 and multistep > 1:
-        if curriculum_schedule is None:
-            curriculum_schedule = []
-            k = 1
-            while k < multistep:
-                curriculum_schedule.append(k)
-                k *= 2
-            curriculum_schedule.append(multistep)
-        print(f"Curriculum: {curriculum_schedule} x {curriculum_epochs} epochs/phase")
-    else:
-        curriculum_schedule = None
+    # Use the same curriculum as the optimizer-step budget calculation.
+    curriculum_schedule = schedule if len(schedule) > 1 else None
+    if curriculum_schedule is not None:
+        print(f"Curriculum: {schedule} x {curriculum_epochs} epochs/phase")
 
-    # Helper function to determine the current value of K based on the epoch and curriculum schedule.
     def _K_for_epoch(ep):
         if curriculum_schedule is None:
             return multistep
-        phase = min(ep // curriculum_epochs, len(curriculum_schedule) - 1)
-        return curriculum_schedule[phase]
+        return schedule[min(ep // curriculum_epochs, len(schedule) - 1)]
 
     train_loss_epochs, train_loss_values = [], []
     val_loss_epochs, val_loss_values = [], []
@@ -709,6 +761,8 @@ def train_force_gnn(Wall,
     global_step = 0         # optimizer steps taken, logged in the loss history
     chain_index = None
     chain_index_k = None
+    eligible_since = None
+    stopped_early = False
 
     # ---------------- epochs ----------------
     # Main training loop over the specified number of epochs.
@@ -719,6 +773,10 @@ def train_force_gnn(Wall,
 
         # Determine the current value of multistep for this epoch based on the curriculum schedule.
         _K_now = _K_for_epoch(epoch)
+        best_eligible = _K_now == multistep
+        first_eligible_epoch = best_eligible and eligible_since is None
+        if first_eligible_epoch:
+            eligible_since = epoch + 1
 
         # Build the chain index only when K changes. The index is deterministic
         # for a fixed dataset, h, and K; iterate_force_chains() independently
@@ -726,6 +784,8 @@ def train_force_gnn(Wall,
         if chain_index is None or _K_now != chain_index_k:
             chain_index = build_chain_index(dataset_train, h, _K_now)
             chain_index_k = _K_now
+            if not chain_index:
+                raise ValueError(f"No training windows available for history={h}, rollout K={_K_now}")
 
         # Record the time after building the chain index to measure the overhead of this operation.
         t1 = time.time()
@@ -780,6 +840,7 @@ def train_force_gnn(Wall,
         if num_batches % accumulation_steps != 0:      # flush the remainder
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            global_step += 1
 
 
         # Compute the average training loss for the epoch and record it.
@@ -819,7 +880,13 @@ def train_force_gnn(Wall,
 
         # Perform validation at the specified interval, rolling out the model on the validation 
         # dataset and recording the results.
-        if epoch % validation_check_interval == 0:
+        # Validate at the patience deadline, even between regular checks, so a
+        # last-minute improvement can reset the counter before stopping.
+        last_improvement = best_val_epoch if best_val_epoch >= 0 else eligible_since
+        patience_due = (early_stopping_patience is not None and best_eligible
+                        and epoch_num - last_improvement >= early_stopping_patience)
+        if (epoch % validation_check_interval == 0 or epoch_num == epochs
+                or first_eligible_epoch or patience_due):
 
             # Determine the value of k/m to use for validation, either the learned value or the initial one.
             k_val = float(phys.k_over_m.detach()) if learn_k else k_over_m
@@ -844,10 +911,11 @@ def train_force_gnn(Wall,
 
             # Check if the current validation loss is the best so far and if it is eligible to be 
             # considered the best.
-            best_eligible = (multistep <= 1) or (curriculum_schedule is None) or (_K_now == multistep)
+            # A budget shorter than warm-up still needs a usable saved model.
+            save_eligible = best_eligible or (epoch_num == epochs and best_val_epoch < 0)
 
             # Update the best validation loss and save the model if the current loss is the best and eligible.
-            if avg_val_loss < best_val_loss and best_eligible:
+            if avg_val_loss < best_val_loss and save_eligible:
                 best_val_loss = float(avg_val_loss)
                 best_val_epoch = epoch_num
                 best_model_path = stem + "_best_model.pt"
@@ -859,6 +927,10 @@ def train_force_gnn(Wall,
             elif avg_val_loss < best_val_loss:
                 print(f"  (val {avg_val_loss:.6f} beats best, but curriculum K={_K_now} "
                       f"< final K={multistep} -- not saved)")
+
+            last_improvement = best_val_epoch if best_val_epoch >= 0 else eligible_since
+            stopped_early = (early_stopping_patience is not None and best_eligible
+                             and epoch_num - last_improvement >= early_stopping_patience)
 
             # Print the summary of the current epoch, including training and validation losses.
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.9f} | "
@@ -879,7 +951,10 @@ def train_force_gnn(Wall,
                         # read mid-flight otherwise loses the k history
                         # entirely and the report has no k drift.
                         "k_trace": k_trace,
-                        "global_step": global_step}, loss_history_path)
+                        "global_step": global_step,
+                        "epochs_completed": epoch_num,
+                        "early_stopping_patience": early_stopping_patience,
+                        "stopped_early": stopped_early}, loss_history_path)
         else:
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.9f}")
 
@@ -915,6 +990,11 @@ def train_force_gnn(Wall,
                     else f"last {keep_last_n_checkpoints}")
             print(f"Checkpoint saved to {checkpoint_path}  (keeping {kept})")
 
+        if stopped_early:
+            print(f"Early stopping at epoch {epoch_num}: no new best validation "
+                  f"center error for {early_stopping_patience} epochs "
+                  f"(best epoch: {best_val_epoch}, best loss: {best_val_loss:.6f}).")
+            break
 
     # Save the final model and physics parameters after training is complete.
     final_path = stem + "_final.pt"
@@ -944,7 +1024,10 @@ def train_force_gnn(Wall,
                 "best_val_epoch": best_val_epoch,
                 "mu_trace": mu_trace,
                 "k_trace": k_trace,
-                "global_step": global_step}, loss_history_path)
+                "global_step": global_step,
+                "epochs_completed": epoch_num,
+                "early_stopping_patience": early_stopping_patience,
+                "stopped_early": stopped_early}, loss_history_path)
     print(f"Loss history saved to {loss_history_path} "
           f"(total optimizer steps: {global_step})")
 

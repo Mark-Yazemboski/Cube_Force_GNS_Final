@@ -155,7 +155,9 @@ def collect_run_diagnostics(save_model_path, last_n=20):
         # Copy scalar training-summary values into the report metrics.
         for src, dst in (("best_val_loss", "best_val_loss"),
                          ("best_val_epoch", "best_val_epoch"),
-                         ("global_step", "total_optimizer_steps")):
+                         ("global_step", "total_optimizer_steps"),
+                         ("epochs_completed", "epochs_completed"),
+                         ("stopped_early", "stopped_early")):
             if hi.get(src) is not None:
                 out[dst] = float(hi[src])
 
