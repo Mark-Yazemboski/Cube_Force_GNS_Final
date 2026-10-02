@@ -178,13 +178,13 @@ loss_mode = "accel"
 
 # --- FRICTION -----------------------------------------------------------
 
-w_fric_dir = .3       #direction: Enforces the correct orientation of the friction force relative to the slip direction
-w_fric_mag = .1       #magnitude: Enforces the friction forces to follow Coulomb's law
+w_fric_dir = 6       #direction: Enforces the correct orientation of the friction force relative to the slip direction
+w_fric_mag = 1       #magnitude: Enforces the friction forces to follow Coulomb's law
 w_fric_cone= 1.5       #Cone: Enforces the friction force to lie within the Coulomb friction cone
 
 # --- FLUID -----------------------------------------------------------
 
-w_fluid_anchor = 3e-2  #Fluid anchor: Enforces the fluid force to stay near the analytic drag law
+w_fluid_anchor = 2e-1  #Fluid anchor: Enforces the fluid force to stay near the analytic drag law
 w_fluid_smooth = 3e-2  #Fluid smooth: Enforces the fluid force to vary smoothly in time (K >= 2 only)
 
 
